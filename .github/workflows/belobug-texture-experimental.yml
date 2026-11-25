@@ -1,7 +1,7 @@
-name: AMD Performance Scaling V8 LEAN
+name: AMD Performance V9 Final AVX2
 on:
   push:
-    branches: [amd-performance-core-v8-scaling]
+    branches: [amd-performance-core-v9-final]
     paths:
       - '.github/workflows/belobug-texture-experimental.yml'
       - 'belobug-texture-patches/**'
@@ -66,6 +66,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply ../belobug-texture-patches/performance-core-v8-scaling.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply --check ../belobug-texture-patches/performance-core-v9-final.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply ../belobug-texture-patches/performance-core-v9-final.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:CARGO_PROFILE_RELEASE_LTO = 'thin'
           $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '1'
           cargo build --locked --release -p victory
@@ -78,11 +82,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item runtime/target/release/victory.exe,runtime/README.md,runtime/LICENSE dist/
-          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch,belobug-texture-patches/performance-core.patch,belobug-texture-patches/performance-core-v2.patch,belobug-texture-patches/performance-core-v3.patch,belobug-texture-patches/performance-core-v4.patch,belobug-texture-patches/performance-core-v7-lean.patch,belobug-texture-patches/performance-core-v8-scaling.patch dist/
+          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch,belobug-texture-patches/performance-core.patch,belobug-texture-patches/performance-core-v2.patch,belobug-texture-patches/performance-core-v3.patch,belobug-texture-patches/performance-core-v4.patch,belobug-texture-patches/performance-core-v7-lean.patch,belobug-texture-patches/performance-core-v8-scaling.patch,belobug-texture-patches/performance-core-v9-final.patch dist/
           $manifest = [ordered]@{
             upstream_repository = 'Belobug/VIctory-Belobug-AMD'
             upstream_commit = '71652a2c15a0da68cd801890e1f71109670f9ca5'
-            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch','performance-core.patch','performance-core-v2.patch','performance-core-v3.patch','performance-core-v4.patch','performance-core-v7-lean.patch','performance-core-v8-scaling.patch')
+            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch','performance-core.patch','performance-core-v2.patch','performance-core-v3.patch','performance-core-v4.patch','performance-core-v7-lean.patch','performance-core-v8-scaling.patch','performance-core-v9-final.patch')
             codegen = 'Release, Thin LTO, one codegen unit; no diagnostics feature'
             validation = 'Build and CLI smoke test only at packaging; hardware validation pending. Workspace tests reported separately in this run.'
             control_commit = $env:GITHUB_SHA
@@ -112,7 +116,7 @@ jobs:
           Bounded suppression of repeated held-memory-wait probes (100us); progress invalidates the probe, polling and forced progress retained.
           Stage timing splits card, shadow and explicit readback. No hardware overlay.
           V7 LEAN: indexed sparse pending ranges and canonical sparse root grouping; opt-in and no async. No V5 or V6 patch applied.
-          V8: experimental PC FidelityFX bridge adapted from PastiiJay/klbf-lab 7b698b9652e88ecabd823f0dd9138dd9c40dd7bd (upstream PC FSR contributors). Requires separately obtained official AMD FidelityFX SDK 2.x signed DX12 binaries. No SDK DLLs are packaged. Native Series S selects the title's own render profile; actual internal and upscale sizes are logged by FSR. No forced resolution patch, no RGB9E5 conversion fallback; unsupported resources return an error. No GPU validation yet.
+          V8: experimental PC FidelityFX bridge adapted from PastiiJay/klbf-lab 7b698b9652e88ecabd823f0dd9138dd9c40dd7bd (upstream PC FSR contributors). Requires separately obtained official AMD FidelityFX SDK 2.x signed DX12 binaries. No SDK DLLs are packaged. Native Series S selects the title's own render profile; actual internal and upscale sizes are logged by FSR. V8.1 includes FP16 scratch and GPU RGB9E5 packing. V9 adds exact AVX2 memory merge (scalar fallback) and skips fully covered refreshes. Performance unmeasured.
           Coalesced ordinary nonoverlapping refreshes can run in parallel (opt-in).
           Completed fences skip the event wait; main queue calls, lock and fence time are reported.
           Optional batch GPU timestamps: VICTORY_GPU_TIMING_BATCH=1 plus VICTORY_D3D12_DRED=1.
@@ -135,6 +139,7 @@ jobs:
           $env:VICTORY_PERF_PARALLEL_READBACK = '1'
           $env:VICTORY_PERF_BOUNDED_REPROBE = '1'
           $env:VICTORY_PERF_INDEXED_PENDING = '1'
+          $env:VICTORY_PERF_AVX2_MERGE = '1'
           $env:VICTORY_SWEEP_TILES = '0'
           $env:VICTORY_RAYS = '0'
           $env:RUST_LOG = 'info,victory_gpu::pipeline=warn,victory_gpu::pipeline::library=info'
@@ -166,7 +171,7 @@ jobs:
           '@ | Set-Content dist/Iniciar-V8.ps1 -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: amd-performance-core-v8-SCALING-LEAN
+          name: amd-performance-core-v9-FINAL-AVX2
           path: dist/
           if-no-files-found: error
       - name: Run workspace tests (results may fail on hosted GPU)
