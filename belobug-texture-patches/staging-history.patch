@@ -375,4 +375,52 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
 +        total <= snapshot_pool_limit()
      });
  }
+diff --git a/crates/victory-gpu/src/card.rs b/crates/victory-gpu/src/card.rs
+--- a/crates/victory-gpu/src/card.rs
++++ b/crates/victory-gpu/src/card.rs
+@@ -97,7 +97,21 @@
  
+ /// Bytes currently allocated in VRAM for card buffers (`[0]`) and their hash
+ /// tables (`[1]`).
+-static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++pub(crate) fn allocated_bytes() -> (u64, u64) {
++    (CARD_BYTES[0].load(Ordering::Relaxed), CARD_BYTES[1].load(Ordering::Relaxed))
++}
++
++fn card_budget_percent() -> u64 {
++    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *LIMIT.get_or_init(|| {
++        std::env::var("VICTORY_CARD_BUDGET_PERCENT").ok()
++            .and_then(|v| v.parse::<u64>().ok())
++            .filter(|&v| (50..=85).contains(&v))
++            .unwrap_or(80)
++    })
++}
+ 
+ /// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
+ static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
+@@ -188,7 +202,7 @@
+         }
+         if let Some([(used, budget), _]) = crate::host::video_memory()
+             && budget > 0
+-            && used.saturating_add(size) > budget * 75 / 100
++            && used.saturating_add(size) > budget * card_budget_percent() / 100
+         {
+             return None;
+         }
+diff --git a/crates/victory-gpu/src/memstat.rs b/crates/victory-gpu/src/memstat.rs
+--- a/crates/victory-gpu/src/memstat.rs
++++ b/crates/victory-gpu/src/memstat.rs
+@@ -132,7 +132,9 @@
+             mib(crate::texture::staged_bytes()),
+             mib(crate::shadow::pool_bytes()),
+         );
+-        if let Some([local, system]) = crate::host::video_memory() {
++        let (card, hashes) = crate::card::allocated_bytes();
++        let _ = write!(line, ", card buffers {} MiB, card hashes {} MiB", mib(card), mib(hashes));
++        if let Some([local, system]) = crate::host::video_memory() {
+             let _ = write!(
+                 line,
+                 ", driver: video {} of {} MiB, system {} MiB",
