@@ -1,0 +1,306 @@
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -347,6 +347,8 @@
+     /// Entries naming each resource.
+     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
+-    free: Vec<u32>,
+-}
++    free: Vec<u32>,
++    released: std::collections::VecDeque<(u32, u32)>,
++    release_count: u64,
++}
+ 
+ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+@@ -354,6 +356,8 @@
+     index: std::collections::BTreeMap::new(),
+     by_resource: std::collections::BTreeMap::new(),
+-    free: Vec::new(),
+-});
++    free: Vec::new(),
++    released: std::collections::VecDeque::new(),
++    release_count: 0,
++});
+ const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+ 
+@@ -418,5 +422,8 @@
+         }
+         views.index.remove(&view);
+-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
++        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
++        views.released.push_back((i, generation));
++        views.release_count += 1;
++        if views.released.len() > 65536 { views.released.pop_front(); }
+         // The view's other resource (a counter) keeps a stale entry, which
+         // `forget` of that resource skips.
+@@ -425,5 +432,18 @@
+ }
+ 
+-/// Of `entries` (slot, (view entry, generation)), those whose view went
++/// Bounded generation journal; None requires the original full scan.
++#[cfg(windows)]
++fn released_views_since(seen: u64) -> (Option<Vec<(u32, u32)>>, u64) {
++    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
++    let now = views.release_count;
++    let n = now.saturating_sub(seen);
++    if n > views.released.len() as u64 || seen > now {
++        (None, now)
++    } else {
++        (Some(views.released.iter().skip(views.released.len() - n as usize).copied().collect()), now)
++    }
++}
++
++/// Of `entries` (slot, (view entry, generation)), those whose view went
+ /// stale: one look at the views for all.
+ #[cfg(windows)]
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -15,5 +15,5 @@
+ use windows::Win32::Graphics::Dxgi::Common::*;
+ 
+-use super::{VIEW_TAG, View, stale_views, view_at};
++use super::{VIEW_TAG, View, released_views_since, stale_views, view_at};
+ use crate::host::{Host, host};
+ 
+@@ -160,5 +160,7 @@
+ struct Bindless {
+     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
+-    slots: BTreeMap<u32, (u32, u32)>,
++    slots: BTreeMap<u32, (u32, u32)>,
++    by_view: HashMap<(u32, u32), BTreeSet<u32>>,
++    release_seen: u64,
+     /// Of them, those viewing placed textures.
+     placed_set: BTreeMap<u32, (u32, u32)>,
+@@ -225,6 +227,26 @@
+ const URGENT: usize = 2048;
+ 
+-impl Bindless {
+-    /// The slot-making budget, refilled for the time passed since.
++impl Bindless {
++    fn remove_view_index(&mut self, slot: u32, entry: (u32, u32)) {
++        if let Some(set) = self.by_view.get_mut(&entry) {
++            set.remove(&slot);
++            if set.is_empty() { self.by_view.remove(&entry); }
++        }
++    }
++    fn set_slot(&mut self, slot: u32, entry: (u32, u32)) -> bool {
++        let old = self.slots.insert(slot, entry);
++        if old == Some(entry) { return false; }
++        if let Some(old) = old { self.remove_view_index(slot, old); }
++        self.by_view.entry(entry).or_default().insert(slot);
++        true
++    }
++    fn remove_slot(&mut self, slot: u32) -> bool {
++        if let Some(old) = self.slots.remove(&slot) {
++            self.remove_view_index(slot, old);
++            true
++        } else { false }
++    }
++
++    /// The slot-making budget, refilled for the time passed since.
+     fn budget(&mut self) -> &mut [u64; 2] {
+         let now = std::time::Instant::now();
+@@ -244,5 +266,11 @@
+ 
+ /// Slots waiting to be made: at submission, at recording (for the log).
+-pub(crate) static BACKLOG: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
++pub(crate) static BACKLOG: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
++
++static V10_VIEW_SCAN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++pub(crate) fn log_v10_view_scan() {
++    let [old_slots, candidates, fallbacks] = V10_VIEW_SCAN.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(old_slots, candidates, fallbacks, "V10 incremental descriptor validation");
++}
+ 
+ /// What one bindless slot needs at submission.
+@@ -1125,5 +1153,5 @@
+     fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
+         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+-        if b.slots.insert(index, entry) != Some(entry) {
++        if b.set_slot(index, entry) {
+             b.dirty.insert(index);
+             b.recent.push(index);
+@@ -1145,5 +1173,5 @@
+     fn untrack_bindless(&self, index: u32) {
+         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+-        if b.slots.remove(&index).is_some() {
++        if b.remove_slot(index) {
+             b.dirty.insert(index);
+             b.recent.push(index);
+@@ -1165,5 +1193,5 @@
+         b.recorded.remove(&index);
+         if entry.is_none_or(|e| b.slots.get(&index) == Some(&e)) {
+-            b.slots.remove(&index);
++            b.remove_slot(index);
+             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
+                 bounce.active = false;
+@@ -1705,13 +1733,27 @@
+             // Exclude them from the stale-view scan as well as other dirty slots.
+             dirty.extend(urgent.iter().copied());
+-            let check: Vec<(u32, (u32, u32))> = if viewed {
+-                b.slots
+-                    .iter()
+-                    .filter(|(i, _)| !dirty.contains(i))
+-                    .map(|(&i, &v)| (i, v))
+-                    .collect()
+-            } else {
+-                Vec::new()
+-            };
++            let check: Vec<(u32, (u32, u32))> = if viewed {
++                let (released, seen) = released_views_since(b.release_seen);
++                b.release_seen = seen;
++                V10_VIEW_SCAN[0].fetch_add(b.slots.len() as u64, Ordering::Relaxed);
++                let check: Vec<_> = if let Some(released) = released {
++                    let mut candidates = Vec::new();
++                    for entry in released {
++                        if let Some(slots) = b.by_view.get(&entry) {
++                            candidates.extend(slots.iter().filter(|i| !dirty.contains(i)).map(|&i| (i, entry)));
++                        }
++                    }
++                    candidates.sort_unstable();
++                    candidates.dedup();
++                    candidates
++                } else {
++                    V10_VIEW_SCAN[2].fetch_add(1, Ordering::Relaxed);
++                    b.slots.iter().filter(|(i, _)| !dirty.contains(i)).map(|(&i, &v)| (i, v)).collect()
++                };
++                V10_VIEW_SCAN[1].fetch_add(check.len() as u64, Ordering::Relaxed);
++                check
++            } else {
++                Vec::new()
++            };
+             for i in &urgent {
+                 dirty.remove(i);
+@@ -1830,7 +1872,11 @@
+             retained.extend(u.read.is_some().then(|| u.retained.clone()).flatten());
+         }
+-        bounces.sort_unstable_by_key(|b| b.1);
+-        let plan = Arc::new(BindlessPlan {
+-            reads: Arc::new(merged(reads, READ_GAP)),
++        bounces.sort_unstable_by_key(|b| b.1);
++        // Aliases forward updates to the same sparse root.
++        for (shadow, _, _) in &mut reads {
++            if let Some(root) = shadow.refresh_alias_root() { *shadow = root; }
++        }
++        let plan = Arc::new(BindlessPlan {
++            reads: Arc::new(merged(reads, READ_GAP)),
+             writes: Arc::new(merged(writes, 0)),
+             bounces: Arc::new(bounces),
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -450,6 +450,11 @@
+     }
+ 
+-    /// The same for copies that share their memory.
+-    pub(crate) fn root_key(&self) -> usize {
++    /// Sparse aliases forward update_lazily to this same root.
++    pub(crate) fn refresh_alias_root(&self) -> Option<Arc<Self>> {
++        self.sparse.as_ref().and_then(|s| s.of.as_ref()).cloned()
++    }
++
++    /// The same for copies that share their memory.
++    pub(crate) fn root_key(&self) -> usize {
+         self.sparse_root()
+             .map_or(std::ptr::from_ref(self) as usize, |(r, _)| std::ptr::from_ref(r) as usize)
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -3564,5 +3564,6 @@
+             log_gpu_times();
+             crate::timeline::log_perf();
+-            crate::shadow::log_sparse_perf();
++            crate::shadow::log_sparse_perf();
++            crate::descriptor::host::log_v10_view_scan();
+             tracing::info!(card_back_ms = card_back, shadow_back_ms = shadow_back, explicit_back_ms = explicit_back,
+                 "readback critical path per frame");
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -766,9 +766,10 @@
+                 .expect("create host texture");
+         }
+-        let copy = Arc::new(HostTexture {
+-            slot: None,
+-            skip: 0,
+-            written: Default::default(),
+-            twin: Default::default(),
++        let copy = Arc::new(HostTexture {
++            slot: None,
++            skip: 0,
++            written: Default::default(),
++            twin: Default::default(),
++            fsr_output: Default::default(),
+             texture: resource.unwrap(),
+             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -1236,9 +1236,19 @@
+             s.threads = Some([ms.threads, 1, 1]);
+             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+-            s.mesh = Some(super::shader::Mesh {
+-                max_vertices: ms.max_vertices,
+-                max_primitives: ms.max_primitives,
+-                topology: ms.topology,
+-            });
++            let mesh = super::shader::Mesh {
++                max_vertices: ms.max_vertices,
++                max_primitives: ms.max_primitives,
++                topology: ms.topology,
++            };
++            // Adapted from Marvisak/VIctory #2398: each lane writes only
++            // its own output. Keep signatures and the D3D12 32 KiB limit.
++            let tight = super::shader::Mesh {
++                max_vertices: mesh.max_vertices.min(ms.threads),
++                max_primitives: mesh.max_primitives.min(ms.threads),
++                ..mesh
++            };
++            s.mesh = Some(if mesh_output_bytes(&s.outputs, &s.prims, mesh) > MAX_MESH_OUTPUT_BYTES
++                && mesh_output_bytes(&s.outputs, &s.prims, tight) <= MAX_MESH_OUTPUT_BYTES
++            { tight } else { mesh });
+             // Barriers order the lanes' LDS accesses; the console's
+             // allocation request needs them too, but the host does not. One
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -166,5 +166,11 @@
+ }
+ 
+-/// Slots the host's view heaps have at least (`victory-gpu` pads them); the
++/// Opt-in spill translation; incomplete BVH chains can still hang the GPU.
++pub fn spill_experimental() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_UNSPILL").is_some_and(|v| v == "1"))
++}
++
++/// Slots the host's view heaps have at least (`victory-gpu` pads them); the
+ /// last is always null. The title's heap is 1,245,184 slots, with
+ /// `victory-gpu`'s own slots after it.
+@@ -301,7 +307,11 @@
+     // `VICTORY_RAYS` is off lets later stages (e.g. `c42a31951201f9a0`) read
+     // uninitialized data from dropped stages and page-fault the GPU.
+-    if rays() {
+-        crate::unspill::unspill(&mut p, &native.layout, native.stage);
+-    }
++    let spilled = spill_experimental()
++        && native.stage == HwStage::Cs
++        && native.layout.iter().map(|r| native.stage.user_sgpr(r.user_data)).min() == Some(16)
++        && native.layout.iter().all(|r| native.stage.user_sgpr(r.user_data) >= 16);
++    if rays() || spilled {
++        crate::unspill::unspill(&mut p, &native.layout, native.stage);
++    }
+     crate::sgpr_spill::forward(&mut p);
+     let traces = resource::traces_rays(&p);
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -63,5 +63,6 @@
+             Ok(mut bytes) => {
+                 bytes.extend_from_slice(&limit.to_le_bytes());
+-                bytes.push(victory_shader::emit::rays().into());
++                bytes.push(victory_shader::emit::rays().into());
++                bytes.push(victory_shader::emit::spill_experimental().into());
+                 *blake3::hash(&bytes).as_bytes()
+             }
