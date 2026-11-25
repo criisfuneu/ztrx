@@ -1,0 +1,185 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -167,7 +167,8 @@
+ pub(crate) fn sparse_writes_text() -> String {
+     let [declared, taken, compared, differed] =
+         [0, 1, 2, 3].map(|i| SPARSE_WRITES[i].swap(0, Ordering::Relaxed) as f64 / 1e6);
+-    format!("declared {declared:.1} MB, snapshots {taken:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB")
++    let reused = READBACK_MAPPINGS.swap(0, Ordering::Relaxed);
++    format!("declared {declared:.1} MB, snapshots {taken:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB; readback mappings reused {reused}")
+ }
+ 
+ /// Bytes of the snapshot memory kept for reuse.
+@@ -1422,11 +1423,21 @@
+     }
+ }
+ 
+-struct Sparse {
+-    /// By tile: where the CPU writes it, and where it is in which heap.
+-    tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
+-    /// What tiles shaders write held before the submission.
+-    before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
++struct SparseSnapshot {
++    bytes: Vec<u8>,
++    // Persistently mapped CPU address; only reused with tile sweeping off.
++    data: usize,
++}
++
++#[cfg(feature = "diagnostics")]
++static READBACK_MAPPINGS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++struct Sparse {
++    /// By tile: where the CPU writes it, and where it is in which heap.
++    tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
++    /// What tiles shaders write held before the submission.
++    before: Mutex<std::collections::HashMap<u32, SparseSnapshot, Mix>>,
+     /// By tile: the frame to look at it next in, and how often in a row it
+     /// had not changed.
+     looks: Mutex<std::collections::HashMap<u32, Arc<Mutex<Look>>, Mix>>,
+@@ -1949,42 +1960,61 @@
+                 let whole = data as usize & !(PAGE - 1);
+                 let mut buf = pooled_tile();
+                 // SAFETY: the tile's mapping.
+-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
+-                buf
+-            });
+-        });
+-    }
+-
+-    /// [`Shadow::copy_back`] of a sparse copy.
++                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
++                SparseSnapshot { bytes: buf, data: whole }
++            });
++        });
++    }
++
++    /// [`Shadow::copy_back`] of a sparse copy.
+     fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+         let start = self.start as usize;
+         let mut written = 0;
+         let mut title: Option<Vec<u8>> = None;
+-        self.each_tile(s, address, address + len, |at, data, n| {
+-            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
+-                return;
+-            };
+-            let old = &mut old[at % PAGE..at % PAGE + n];
+-            // SAFETY: the tile's mapping; only this thread writes it.
+-            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
++        // With sweeping disabled, tiles retain their mappings for the life of
++        // the sparse root. Reuse the address recorded at snapshot time rather
++        // than locking and searching the tile map again for every piece.
++        let reuse = sweeps() == 0;
++        #[cfg(feature = "diagnostics")]
++        let mut reused = 0u64;
++        let end = address + len;
++        let mut next = address;
++        while next < end {
++            let at = next;
++            let n = (PAGE - at % PAGE).min(end - at);
++            next += n;
++            let Some(snapshot) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
++                continue;
++            };
++            let data = if reuse {
++                #[cfg(feature = "diagnostics")]
++                { reused += 1; }
++                snapshot.data
++            } else {
++                let Some(data) = self.tile(s, at) else { continue };
++                data
++            };
++            let old = &mut snapshot.bytes[at % PAGE..at % PAGE + n];
++            // SAFETY: the persistent tile mapping, offset inside this page.
++            let host = unsafe { std::slice::from_raw_parts_mut((data + at % PAGE) as *mut u8, n) };
+             #[cfg(feature = "diagnostics")]
+             SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+-            if host == old {
+-                return;
+-            }
+-            #[cfg(feature = "diagnostics")]
+-            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
++            if host == old {
++                continue;
++            }
++            #[cfg(feature = "diagnostics")]
++            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+             let buf = title.get_or_insert_with(|| {
+                 let mut v = pooled(PAGE);
+                 v.resize(PAGE, 0);
+                 v
+             });
+-            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+-                return;
+-            }
+-            if let Some((dirty_start, dirty_end)) =
+-                merge_gpu_writes_mut(&mut buf[..n], host, old)
++            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
++                continue;
++            }
++            if let Some((dirty_start, dirty_end)) =
++                merge_gpu_writes_mut(&mut buf[..n], host, old)
+             {
+                 let dirty_len = dirty_end - dirty_start;
+                 crate::watch::writing(at + dirty_start, dirty_len);
+@@ -1993,17 +2023,19 @@
+                     buf[dirty_start..].as_ptr(),
+                     dirty_len,
+                 );
+-                written += dirty_len;
+-            }
+-        });
+-        if let Some(buf) = title {
+-            give_back(buf);
+-        }
+-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+-        pending.retain(|&r| r != (address, address + len));
+-        if pending.is_empty() {
+-            give_back_tiles(before.drain().map(|(_, buf)| buf));
+-        }
++                written += dirty_len;
++            }
++        }
++        #[cfg(feature = "diagnostics")]
++        READBACK_MAPPINGS.fetch_add(reused, Ordering::Relaxed);
++        if let Some(buf) = title {
++            give_back(buf);
++        }
++        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
++        pending.retain(|&r| r != (address, address + len));
++        if pending.is_empty() {
++            give_back_tiles(before.drain().map(|(_, snapshot)| snapshot.bytes));
++        }
+         written
+     }
+ }
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -215,7 +215,23 @@
+     pub(crate) fn translated(&self) -> Option<&Translated> {
+         self.translated
+             .get_or_init(|| {
+-                let done = translate(&self.container);
++                let done = translate(&self.container);
++                #[cfg(feature = "diagnostics")]
++                if let Err(error) = &done
++                    && self.stage == "compute"
++                    && error.contains("an address in an SGPR")
++                    && let Ok(container) = victory_shader::Container::parse(&self.container)
++                    && let Ok(programs) = victory_shader::container_programs(&container)
++                {
++                    for program in programs.iter().filter(|p| p.stage == victory_shader::HwStage::Cs) {
++                        tracing::info!(
++                            hash = %self.hash,
++                            wave64 = program.wave64,
++                            layout = ?program.layout,
++                            "compute SGPR root layout on translation failure"
++                        );
++                    }
++                }
+                 #[cfg(feature = "diagnostics")]
+                 if done.is_err()
+                     || std::env::var("VICTORY_SHADER_HASHES")
