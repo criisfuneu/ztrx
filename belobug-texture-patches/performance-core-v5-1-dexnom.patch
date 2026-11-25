@@ -1,0 +1,106 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2634,7 +2634,49 @@
+         let mut refresh_count = 0u64;
+         #[cfg(feature = "diagnostics")]
+-        let mut refresh_bytes = 0u64;
+-        for step in &deferred.copies {
+-            match step {
++        let mut refresh_bytes = 0u64;
++        // DexNom-inspired independent upload fills, adapted to the existing
++        // Step representation. Never cross a non-fill command.
++        let mut steps = deferred.copies.iter().peekable();
++        while let Some(step) = steps.next() {
++            if dexnom_fills_enabled() && matches!(step, Step::Fill(..)) {
++                let mut end = 1usize;
++                let mut cursor = steps.clone();
++                while end < 4096 && cursor.peek().is_some_and(|s| matches!(s, Step::Fill(..))) {
++                    cursor.next();
++                    end += 1;
++                }
++                if end >= 256 {
++                    let mut fills = Vec::with_capacity(end);
++                    if let Step::Fill(dst, src, len) = *step {
++                        fills.push((dst, src, len));
++                    }
++                    for next in steps.by_ref().take(end - 1) {
++                        if let Step::Fill(dst, src, len) = *next {
++                            fills.push((dst, src, len));
++                        }
++                    }
++                    let started = std::time::Instant::now();
++                    let parallel = independent_upload_fills(&fills);
++                    let run = |chunk: &[(usize, usize, usize)]| {
++                        for &(dst, src, len) in chunk {
++                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
++                        }
++                    };
++                    if parallel {
++                        in_parallel(&fills, 128, run);
++                        DEXNOM_FILLS[0].fetch_add(1, Ordering::Relaxed);
++                        DEXNOM_FILLS[1].fetch_add(fills.len() as u64, Ordering::Relaxed);
++                    } else {
++                        run(&fills);
++                        DEXNOM_FILLS[2].fetch_add(1, Ordering::Relaxed);
++                    }
++                    copy_us += started.elapsed().as_micros() as u64;
++                    copy_bytes += fills.iter().map(|f| f.2 as u64).sum::<u64>();
++                    #[cfg(feature = "diagnostics")]
++                    { copy_count += fills.len() as u64; }
++                    continue;
++                }
++            }
++            match step {
+                 &Step::Copy(dst, src, len) => {
+                     #[cfg(feature = "diagnostics")]
+@@ -3002,5 +3044,38 @@
+ }
+ 
+-/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
++// Inspired by DexNom/VIctory commit 5f4c3df44197eb03b82205d2da871ded8d0ccf16.
++static DEXNOM_FILLS: [std::sync::atomic::AtomicU64; 3] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
++fn dexnom_fills_enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_DEXNOM_FILLS").is_some_and(|v| v == "1"))
++}
++
++// Require monotonically increasing, disjoint scratch destinations and
++// no source intersecting their span. Otherwise preserve serial order.
++fn independent_upload_fills(fills: &[(usize, usize, usize)]) -> bool {
++    let Some(&(first, _, _)) = fills.first() else { return false; };
++    let mut end = first;
++    for &(dst, _, len) in fills {
++        let Some(next) = dst.checked_add(len) else { return false; };
++        if dst < end { return false; }
++        end = next;
++    }
++    fills.iter().all(|&(_, src, len)| {
++        src.checked_add(len).is_some_and(|last| src >= end || last <= first)
++    })
++}
++
++#[cfg(test)]
++#[test]
++fn upload_fill_independence_checks_aliases_and_overflow() {
++    assert!(independent_upload_fills(&[(100, 1000, 8), (108, 2000, 8)]));
++    assert!(!independent_upload_fills(&[(100, 1000, 8), (104, 2000, 8)]));
++    assert!(!independent_upload_fills(&[(100, 1000, 8), (108, 100, 8)]));
++    assert!(!independent_upload_fills(&[(usize::MAX, 1000, 8)]));
++}
++
++/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
+ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
+     const THREADS: usize = 6;
+@@ -3562,5 +3637,8 @@
+             log_gpu_times();
+             crate::timeline::log_perf();
+-            crate::shadow::log_sparse_perf();
++            crate::shadow::log_sparse_perf();
++            let [fill_batches, fill_items, fill_fallbacks] =
++                DEXNOM_FILLS.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++            tracing::info!(fill_batches, fill_items, fill_fallbacks, "DexNom-inspired upload fill interval");
+             tracing::info!(card_back_ms = card_back, shadow_back_ms = shadow_back, explicit_back_ms = explicit_back,
+                 "readback critical path per frame");
