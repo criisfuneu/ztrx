@@ -1,0 +1,120 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -167,7 +167,8 @@
+ pub(crate) fn sparse_writes_text() -> String {
+     let [declared, taken, compared, differed] =
+         [0, 1, 2, 3].map(|i| SPARSE_WRITES[i].swap(0, Ordering::Relaxed) as f64 / 1e6);
+-    format!("declared {declared:.1} MB, snapshots {taken:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB")
++    let [ranges, tiles] = SNAPSHOT_REUSED.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    format!("declared {declared:.1} MB, snapshots {taken:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB; snapshot ranges reused {ranges}, tile lookups avoided {tiles}")
+ }
+ 
+ /// Bytes of the snapshot memory kept for reuse.
+@@ -1422,11 +1423,23 @@
+     }
+ }
+ 
+-struct Sparse {
+-    /// By tile: where the CPU writes it, and where it is in which heap.
+-    tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
+-    /// What tiles shaders write held before the submission.
+-    before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
++/// Snapshots and complete page spans for the current synchronous submission.
++/// A span is remembered only when every page has a snapshot.
++#[derive(Default)]
++struct SparseBefore {
++    tiles: std::collections::HashMap<u32, Vec<u8>, Mix>,
++    covered: std::collections::HashSet<(u32, u32)>,
++}
++
++#[cfg(feature = "diagnostics")]
++static SNAPSHOT_REUSED: [std::sync::atomic::AtomicU64; 2] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++
++struct Sparse {
++    /// By tile: where the CPU writes it, and where it is in which heap.
++    tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
++    /// What tiles shaders write held before the submission.
++    before: Mutex<SparseBefore>,
+     /// By tile: the frame to look at it next in, and how often in a row it
+     /// had not changed.
+     looks: Mutex<std::collections::HashMap<u32, Arc<Mutex<Look>>, Mix>>,
+@@ -1941,18 +1954,46 @@
+         let start = self.start as usize;
+         #[cfg(feature = "diagnostics")]
+         SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
+-        self.each_tile(s, address, address + len, |at, data, _| {
+-            let tile = ((at - start) / PAGE) as u32;
+-            before.entry(tile).or_insert_with(|| {
+-                #[cfg(feature = "diagnostics")]
+-                SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
+-                let whole = data as usize & !(PAGE - 1);
+-                let mut buf = pooled_tile();
+-                // SAFETY: the tile's mapping.
+-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
+-                buf
+-            });
+-        });
++        if len == 0 {
++            return;
++        }
++        let first = ((address - start) / PAGE) as u32;
++        let last = ((address + len - 1 - start) / PAGE) as u32;
++        if before.covered.contains(&(first, last)) {
++            #[cfg(feature = "diagnostics")]
++            {
++                SNAPSHOT_REUSED[0].fetch_add(1, Ordering::Relaxed);
++                SNAPSHOT_REUSED[1].fetch_add(u64::from(last - first) + 1, Ordering::Relaxed);
++            }
++            return;
++        }
++        let mut complete = true;
++        #[cfg(feature = "diagnostics")]
++        let mut reused = 0u64;
++        for tile in first..=last {
++            // A snapshot already proves the tile was mapped in this submission.
++            // Pending writes prevent its reclamation; copy_back updates last use.
++            if let std::collections::hash_map::Entry::Vacant(entry) = before.tiles.entry(tile) {
++                let Some(data) = self.tile(s, start + tile as usize * PAGE) else {
++                    complete = false;
++                    continue;
++                };
++                #[cfg(feature = "diagnostics")]
++                SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
++                let mut buf = pooled_tile();
++                // SAFETY: the tile's complete mapping, as in each_tile.
++                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(data as *const u8, PAGE) });
++                entry.insert(buf);
++            } else {
++                #[cfg(feature = "diagnostics")]
++                { reused += 1; }
++            }
++        }
++        if complete && before.covered.len() < 4096 {
++            before.covered.insert((first, last));
++        }
++        #[cfg(feature = "diagnostics")]
++        SNAPSHOT_REUSED[1].fetch_add(reused, Ordering::Relaxed);
+     }
+ 
+     /// [`Shadow::copy_back`] of a sparse copy.
+@@ -1962,7 +2003,7 @@
+         let mut written = 0;
+         let mut title: Option<Vec<u8>> = None;
+         self.each_tile(s, address, address + len, |at, data, n| {
+-            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
++            let Some(old) = before.tiles.get_mut(&(((at - start) / PAGE) as u32)) else {
+                 return;
+             };
+             let old = &mut old[at % PAGE..at % PAGE + n];
+@@ -2002,7 +2043,8 @@
+         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+         pending.retain(|&r| r != (address, address + len));
+         if pending.is_empty() {
+-            give_back_tiles(before.drain().map(|(_, buf)| buf));
++            before.covered.clear();
++            give_back_tiles(before.tiles.drain().map(|(_, buf)| buf));
+         }
+         written
+     }
