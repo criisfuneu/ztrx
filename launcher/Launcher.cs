@@ -37,10 +37,13 @@ internal sealed class Launcher : Form {
     volatile Process child;
     volatile bool cancelled;
     bool busy;
+    readonly bool belobug;
     string latestLog;
 
     public Launcher() {
-        Text = "GTA VI - teste AMD";
+        string sourceInfo=Path.Combine(root,"source-info.json");
+        belobug=File.Exists(sourceInfo) && File.ReadAllText(sourceInfo).IndexOf("Belobug/",StringComparison.OrdinalIgnoreCase)>=0;
+        Text = belobug ? "GTA VI - Belobug AMD" : "GTA VI - teste AMD";
         ClientSize = new Size(780, 500);
         MinimumSize = new Size(680, 420);
         StartPosition = FormStartPosition.CenterScreen;
@@ -59,7 +62,7 @@ internal sealed class Launcher : Form {
         }};
         mode.DropDownStyle = ComboBoxStyle.DropDownList;
         mode.Items.AddRange(new object[] { "Series S - menor carga", "Series X" });
-        mode.SelectedIndex = 0;
+        mode.SelectedIndex = belobug ? 1 : 0;
         mode.SetBounds(20, 119, 220, 30);
         start.Text = "Iniciar";
         start.SetBounds(252, 117, 108, 34);
@@ -117,7 +120,7 @@ internal sealed class Launcher : Form {
             string hash;
             using(SHA256 sha=SHA256.Create()) using(FileStream file=File.OpenRead(exe)) hash=BitConverter.ToString(sha.ComputeHash(file)).Replace("-","").Substring(0,16);
             string marker=Path.Combine(root,"cache","warm-"+hash+".ready");
-            if(!File.Exists(marker)) {
+            if(!belobug && !File.Exists(marker)) {
                 Status("Preparando shaders. Isso pode levar varios minutos; acompanhe o log.");
                 int warmed = await Task.Run(() => Run(exe,WarmArguments(title),title,"shaders"));
                 if(cancelled) { Status("Teste encerrado."); return; }
@@ -159,7 +162,7 @@ internal sealed class Launcher : Form {
             string original=Path.Combine(source,Path.GetFileNameWithoutExtension(name)+"_original.dll");
             CopyRuntimeFile(File.Exists(original)?original:path,Path.Combine(destination,name));
         }
-        foreach(string name in new string[] { "MicrosoftGame.config", "appxmanifest.xml" }) {
+        foreach(string name in new string[] { "MicrosoftGame.config", "appxmanifest.xml", "appdata0.rpf" }) {
             string path=Path.Combine(source,name);
             if(File.Exists(path)) CopyRuntimeFile(path,Path.Combine(destination,name));
         }
@@ -186,12 +189,17 @@ internal sealed class Launcher : Form {
         info.EnvironmentVariables["VICTORY_CACHE_DIR"]=Path.Combine(root,"cache");
         info.EnvironmentVariables["VICTORY_DATA_DIR"]=Path.Combine(root,"data");
         info.EnvironmentVariables["VICTORY_LOG"]="info";
-        info.EnvironmentVariables["VICTORY_LATE_WAIT"]="3";
-        info.EnvironmentVariables["VICTORY_RELAY"]="0";
-        info.EnvironmentVariables["VICTORY_WIDE_BACK"]="1";
-        info.EnvironmentVariables["VICTORY_CARD_BUFFERS_MIN_MB"]="1";
-        info.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"]="1024";
-        info.EnvironmentVariables["VICTORY_SHADER_LOOP_LIMIT"]="256";
+        if(belobug) {
+            info.EnvironmentVariables["VICTORY_PRESENT_TARGET"]="1x1:1";
+            info.EnvironmentVariables["VICTORY_HAIR"]="1";
+        } else {
+            info.EnvironmentVariables["VICTORY_LATE_WAIT"]="3";
+            info.EnvironmentVariables["VICTORY_RELAY"]="0";
+            info.EnvironmentVariables["VICTORY_WIDE_BACK"]="1";
+            info.EnvironmentVariables["VICTORY_CARD_BUFFERS_MIN_MB"]="1";
+            info.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"]="1024";
+            info.EnvironmentVariables["VICTORY_SHADER_LOOP_LIMIT"]="256";
+        }
         info.EnvironmentVariables["VICTORY_FRAMETIME_DUMP"]=Path.Combine(root,"logs","frametime-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".csv");
         using(StreamWriter writer=new StreamWriter(log,false,new UTF8Encoding(false))) using(Process process=new Process()) {
             object gate=new object(); writer.AutoFlush=true;
