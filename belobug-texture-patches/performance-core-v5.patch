@@ -1,0 +1,171 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -692,12 +692,12 @@
+             return 0;
+         }
+-        let mut busy: Vec<(usize, usize)> = self
+-            .pending
+-            .lock()
+-            .unwrap_or_else(|e| e.into_inner())
+-            .iter()
+-            .copied()
+-            .filter(|&(a, e)| a < to && e > from)
+-            .collect();
++        let mut busy: Vec<(usize, usize)> = {
++            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
++            if perf_pending_compact() && pending.iter().any(|&(a, e)| a <= from && e >= to) {
++                V5_PERF[1].fetch_add(1, Ordering::Relaxed);
++                return 0;
++            }
++            pending.iter().copied().filter(|&(a, e)| a < to && e > from).collect()
++        };
+         if !busy.is_empty() {
+             // Around ranges shaders are writing: the gaps, each as below
+@@ -1473,8 +1473,24 @@
+     let [batches, pages, checked_bytes, changed_bytes, compare_us] =
+         READBACK_COMPARE.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
+-    tracing::info!(batches, pages, checked_bytes, changed_bytes, compare_us, "parallel sparse readback interval");
++    tracing::info!(batches, pages, checked_bytes, changed_bytes, compare_us, "parallel sparse readback interval");
++    let [duplicates, covered_refreshes, tile_batches, tile_hits] =
++        V5_PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(duplicates, covered_refreshes, tile_batches, tile_hits, "V5 memory work interval");
+ }
+ 
+-// Comparison-only workers: GPU completion and original serial write-back
++static V5_PERF: [std::sync::atomic::AtomicU64; 4] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
++fn perf_pending_compact() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_PENDING_COMPACT").is_some_and(|v| v == "1"))
++}
++
++fn perf_tile_batch() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    sweeps() == 0 && *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_TILE_BATCH").is_some_and(|v| v == "1"))
++}
++
++// Comparison-only workers: GPU completion and original serial write-back
+ // ordering remain mandatory. Do not keep mapped addresses beyond a call.
+ static READBACK_COMPARE: [std::sync::atomic::AtomicU64; 5] =
+@@ -2011,10 +2027,17 @@
+ 
+     /// [`Shadow::writing`] of a sparse copy.
+-    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
+-        self.pending
+-            .lock()
+-            .unwrap_or_else(|e| e.into_inner())
+-            .push((address, address + len));
+-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
++    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
++        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
++        {
++            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
++            let range = (address, address + len);
++            // Completion removes all identical declarations, so one entry is
++            // sufficient. Snapshot coverage and allocation retries are unchanged.
++            if perf_pending_compact() && pending.contains(&range) {
++                V5_PERF[0].fetch_add(1, Ordering::Relaxed);
++            } else {
++                pending.push(range);
++            }
++        }
+         let start = self.start as usize;
+         #[cfg(feature = "diagnostics")]
+@@ -2067,7 +2090,40 @@
+             let started = std::time::Instant::now();
+             let mut jobs = Vec::with_capacity(len.div_ceil(PAGE).min(32768));
+-            self.each_tile(s, address, address + len, |at, data, n| {
+-                jobs.push((at, data as usize, n, std::sync::atomic::AtomicU8::new(0)));
+-            });
++            if perf_tile_batch() {
++                // With sweeping disabled, existing tile mappings remain live.
++                // Collect existing pointers under one lock; missing tiles use
++                // the same allocation path as each_tile.
++                let frame = crate::queue::presented();
++                let mut missing = Vec::new();
++                let mut hits = 0u64;
++                {
++                    let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
++                    let mut at = address;
++                    while at < address + len {
++                        let n = (PAGE - at % PAGE).min(address + len - at);
++                        let key = ((at - start) / PAGE) as u32;
++                        if let Some(t) = tiles.get_mut(&key) {
++                            t.used = frame;
++                            jobs.push((at, t.data + at % PAGE, n, std::sync::atomic::AtomicU8::new(0)));
++                            hits += 1;
++                        } else {
++                            missing.push((at, n));
++                        }
++                        at += n;
++                    }
++                }
++                for (at, n) in missing {
++                    if let Some(data) = self.tile(s, at) {
++                        jobs.push((at, data + at % PAGE, n, std::sync::atomic::AtomicU8::new(0)));
++                    }
++                }
++                jobs.sort_unstable_by_key(|j| j.0);
++                V5_PERF[2].fetch_add(1, Ordering::Relaxed);
++                V5_PERF[3].fetch_add(hits, Ordering::Relaxed);
++            } else {
++                self.each_tile(s, address, address + len, |at, data, n| {
++                    jobs.push((at, data as usize, n, std::sync::atomic::AtomicU8::new(0)));
++                });
++            }
+             let snapshots = &before.tiles;
+             crate::host::in_parallel(&jobs, 32, |chunk| {
+@@ -2212,9 +2268,18 @@
+     let mut last = 0usize;
+     let mut i = 0;
+-    while i + 8 <= n {
+-        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
+-        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+-        if hw == ow {
+-            let tw = &title[i..i + 8];
++    while i + 8 <= n {
++        // Skip an entire equal block without eight word comparisons. The
++        // same title bytes still synchronize both copies; dirty span unchanged.
++        if i + 64 <= n && host[i..i + 64] == old[i..i + 64] {
++            let tw = &title[i..i + 64];
++            host[i..i + 64].copy_from_slice(tw);
++            old[i..i + 64].copy_from_slice(tw);
++            i += 64;
++            continue;
++        }
++        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
++        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
++        if hw == ow {
++            let tw = &title[i..i + 8];
+             host[i..i + 8].copy_from_slice(tw);
+             old[i..i + 8].copy_from_slice(tw);
+@@ -2248,5 +2313,26 @@
+ }
+ 
+-/// Merges GPU-modified bytes (`gpu_new != staging_old`) into `title` and syncs
++#[cfg(test)]
++#[test]
++fn v5_block_merge_matches_reference() {
++    for n in [0usize, 1, 7, 8, 63, 64, 65, 129, 4096] {
++        for stride in [1usize, 17, 67, 257] {
++            let mut title: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
++            let mut old = title.clone();
++            let mut host = old.clone();
++            for i in (0..n).step_by(stride) { host[i] ^= 0x55; }
++            for i in (0..n).step_by(13) { title[i] ^= 0x37; }
++            let mut expected = title.clone();
++            let mut h = host.clone();
++            let span = merge_gpu_writes(&mut expected, &mut h, &old);
++            assert_eq!(merge_gpu_writes_mut(&mut title, &mut host, &mut old), span);
++            assert_eq!(title, expected);
++            assert_eq!(host, h);
++            assert_eq!(old, expected);
++        }
++    }
++}
++
++/// Merges GPU-modified bytes (`gpu_new != staging_old`) into `title` and syncs
+ /// `staging_old` to the merged bytes. Returns `(dirty_span_for_title, cpu_modified)`
+ /// where `cpu_modified` is true if any byte unchanged by the GPU differed in `title`
