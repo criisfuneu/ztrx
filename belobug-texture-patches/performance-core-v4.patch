@@ -1,0 +1,293 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1468,8 +1468,36 @@
+ }
+ 
+-pub(crate) fn log_sparse_perf() {
+-    let [ranges, lookups, bytes] = SPARSE_PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
+-    tracing::info!(ranges, lookups, bytes, "sparse cache performance interval");
+-}
++pub(crate) fn log_sparse_perf() {
++    let [ranges, lookups, bytes] = SPARSE_PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(ranges, lookups, bytes, "sparse cache performance interval");
++    let [batches, pages, checked_bytes, changed_bytes, compare_us] =
++        READBACK_COMPARE.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(batches, pages, checked_bytes, changed_bytes, compare_us, "parallel sparse readback interval");
++}
++
++// Comparison-only workers: GPU completion and original serial write-back
++// ordering remain mandatory. Do not keep mapped addresses beyond a call.
++static READBACK_COMPARE: [std::sync::atomic::AtomicU64; 5] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
++static READBACK_WORKERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++struct ReadbackPermit;
++impl ReadbackPermit {
++    fn try_take(len: usize) -> Option<Self> {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if cfg!(test) || sweeps() != 0 || len < 16 * 1024 * 1024
++            || !*ON.get_or_init(|| std::env::var_os("VICTORY_PERF_PARALLEL_READBACK").is_some_and(|v| v == "1"))
++        {
++            return None;
++        }
++        READBACK_WORKERS.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).ok()?;
++        Some(Self)
++    }
++}
++impl Drop for ReadbackPermit {
++    fn drop(&mut self) {
++        READBACK_WORKERS.store(false, Ordering::Release);
++    }
++}
+ 
+ struct Sparse {
+@@ -2030,7 +2058,48 @@
+         let mut title: Option<Vec<u8>> = None;
+         let cache = sparse_cache_enabled();
+-        let mut skipped = 0u64;
+-        self.each_tile(s, address, address + len, |at, data, n| {
+-            let Some(snapshot) = before.tiles.get_mut(&(((at - start) / PAGE) as u32)) else {
++        let mut skipped = 0u64;
++        // Compare large ranges across cores, before merging any modified bytes.
++        // The before lock serializes aliases of this root; tile sweeping is off.
++        // Only immutable reads occur in workers. The original merge and title
++        // writes below remain serial, in the original address order.
++        let permit = ReadbackPermit::try_take(len);
++        let compared = permit.as_ref().map(|_| {
++            let started = std::time::Instant::now();
++            let mut jobs = Vec::with_capacity(len.div_ceil(PAGE).min(32768));
++            self.each_tile(s, address, address + len, |at, data, n| {
++                jobs.push((at, data as usize, n, std::sync::atomic::AtomicU8::new(0)));
++            });
++            let snapshots = &before.tiles;
++            crate::host::in_parallel(&jobs, 32, |chunk| {
++                for (at, data, n, status) in chunk {
++                    let Some(old) = snapshots.get(&(((*at - start) / PAGE) as u32)) else { continue };
++                    if cache && old.unchanged {
++                        status.store(1, Ordering::Relaxed);
++                        continue;
++                    }
++                    // SAFETY: mapping is live for this call, GPU is finished,
++                    // before lock excludes other readbacks of this sparse root.
++                    let current = unsafe { std::slice::from_raw_parts(*data as *const u8, *n) };
++                    let off = *at % PAGE;
++                    status.store(if current == &old.bytes[off..off + *n] { 1 } else { 2 }, Ordering::Relaxed);
++                }
++            });
++            let mut checked = 0u64;
++            let mut changed = 0u64;
++            for (_, _, n, status) in &jobs {
++                let status = status.load(Ordering::Relaxed);
++                if status != 0 { checked += *n as u64; }
++                if status == 2 { changed += *n as u64; }
++            }
++            READBACK_COMPARE[0].fetch_add(1, Ordering::Relaxed);
++            READBACK_COMPARE[1].fetch_add(jobs.len() as u64, Ordering::Relaxed);
++            READBACK_COMPARE[2].fetch_add(checked, Ordering::Relaxed);
++            READBACK_COMPARE[3].fetch_add(changed, Ordering::Relaxed);
++            READBACK_COMPARE[4].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
++            jobs
++        });
++        drop(permit);
++        let mut process = |at: usize, data: *mut u8, n: usize, comparison: u8| {
++            let Some(snapshot) = before.tiles.get_mut(&(((at - start) / PAGE) as u32)) else {
+                 return;
+             };
+@@ -2044,6 +2113,6 @@
+             #[cfg(feature = "diagnostics")]
+             SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+-            if host == old {
+-                if cache && at % PAGE == 0 && n == PAGE {
++            if comparison == 1 || (comparison == 0 && host == old) {
++                if cache && at % PAGE == 0 && n == PAGE {
+                     snapshot.unchanged = true;
+                 }
+@@ -2070,13 +2139,20 @@
+                     dirty_len,
+                 );
+-                written += dirty_len;
+-            }
+-        });
+-        if let Some(buf) = title {
+-            give_back(buf);
+-        }
+-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+-        pending.retain(|&r| r != (address, address + len));
+-        SPARSE_PERF[2].fetch_add(skipped, Ordering::Relaxed);
++                written += dirty_len;
++            }
++        };
++        if let Some(jobs) = compared {
++            for (at, data, n, status) in jobs {
++                process(at, data as *mut u8, n, status.into_inner());
++            }
++        } else {
++            self.each_tile(s, address, address + len, |at, data, n| process(at, data, n, 0));
++        }
++        if let Some(buf) = title {
++            give_back(buf);
++        }
++        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
++        pending.retain(|&r| r != (address, address + len));
++        SPARSE_PERF[2].fetch_add(skipped, Ordering::Relaxed);
+         if pending.is_empty() {
+             before.covered.clear();
+diff --git a/crates/victory-gpu/src/timeline.rs b/crates/victory-gpu/src/timeline.rs
+--- a/crates/victory-gpu/src/timeline.rs
++++ b/crates/victory-gpu/src/timeline.rs
+@@ -56,6 +56,8 @@
+     // Capture the kind at the moment the wait starts; the front may be
+     // removed by the time it finishes.
+-    held_fence: bool,
+-}
++    held_fence: bool,
++    // Bounded recheck suppression only while the same memory wait is held.
++    last_probe: Option<(Instant, u64)>,
++}
+ 
+ /// Every queue with a timeline.
+@@ -66,5 +68,12 @@
+ // Interval counters: local dispatches, global pumps, queue visits,
+ // fence holds and microseconds, memory holds and microseconds, forced waits.
+-static PERF: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
++static PERF: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
++static PROGRESS_GENERATION: AtomicU64 = AtomicU64::new(0);
++static REPROBE_SKIPS: AtomicU64 = AtomicU64::new(0);
++
++fn bounded_reprobe() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_BOUNDED_REPROBE").is_some_and(|v| v == "1"))
++}
+ 
+ fn local_dispatch_enabled() -> bool {
+@@ -79,6 +88,7 @@
+         PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
+     tracing::info!(
+-        local, pumps, visits, fences, fence_us, memory, memory_us, forced,
+-        "timeline performance interval"
++        local, pumps, visits, fences, fence_us, memory, memory_us, forced,
++        reprobe_skips = REPROBE_SKIPS.swap(0, Ordering::Relaxed),
++        "timeline performance interval"
+     );
+ }
+@@ -147,8 +157,18 @@
+         loop {
+             let mut s = self.lock();
+-            if s.busy {
+-                return moved;
+-            }
+-            let work: Box<dyn FnOnce()> = match s.ops.front_mut() {
++            if s.busy {
++                return moved;
++            }
++            if !force && s.held.is_some() && !s.held_fence && bounded_reprobe() {
++                let generation = PROGRESS_GENERATION.load(Ordering::Acquire);
++                if s.last_probe.is_some_and(|(at, seen)| seen == generation && at.elapsed() < Duration::from_micros(100)) {
++                    REPROBE_SKIPS.fetch_add(1, Ordering::Relaxed);
++                    return moved;
++                }
++                // Arbitrary CPU stores cannot notify us. Keep a bounded
++                // polling fallback and do not suppress forced progress.
++                s.last_probe = Some((Instant::now(), generation));
++            }
++            let work: Box<dyn FnOnce()> = match s.ops.front_mut() {
+                 None => {
+                     s.hold(false);
+@@ -216,6 +236,7 @@
+             }
+             (false, Some(since)) => {
+-                self.held = None;
+-                HELD.fetch_sub(1, Ordering::AcqRel);
++                self.held = None;
++                self.last_probe = None;
++                HELD.fetch_sub(1, Ordering::AcqRel);
+                 let index = if self.held_fence { 3 } else { 5 };
+                 PERF[index].fetch_add(1, Ordering::Relaxed);
+@@ -263,7 +284,8 @@
+ static MOVED: Mutex<Option<Instant>> = Mutex::new(None);
+ 
+-fn progress() {
+-    *MOVED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+-}
++fn progress() {
++    PROGRESS_GENERATION.fetch_add(1, Ordering::Release);
++    *MOVED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
++}
+ 
+ /// Starts the thread that looks at what holds queues back: values the CPU
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -161,7 +161,10 @@
+     [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+ 
+-fn perf_add(index: usize, value: u64) {
+-    PERF_CORE[index].fetch_add(value, Ordering::Relaxed);
+-}
++fn perf_add(index: usize, value: u64) {
++    PERF_CORE[index].fetch_add(value, Ordering::Relaxed);
++}
++
++static CRITICAL_READBACK: [std::sync::atomic::AtomicU64; 3] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+ 
+ fn perf_parallel_refresh() -> bool {
+@@ -1472,6 +1475,8 @@
+             }
+         }
+-        let back = cpu_back;
+-        if back.len() <= 1 {
++        let card_elapsed = copying.elapsed().as_micros() as u64;
++        let back_started = std::time::Instant::now();
++        let back = cpu_back;
++        if back.len() <= 1 {
+             for (shadow, address, len) in &back {
+                 let written = shadow.copy_back(*address, *len);
+@@ -1508,6 +1513,8 @@
+             }
+         }
+-        for list in runs {
+-            for rb in &list.deferred().readbacks {
++        let shadow_elapsed = back_started.elapsed().as_micros() as u64;
++        let explicit_started = std::time::Instant::now();
++        for list in runs {
++            for rb in &list.deferred().readbacks {
+                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
+                     let bytes = rb.row_bytes * rb.lines;
+@@ -1529,6 +1536,9 @@
+             }
+         }
+-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+-        // Host timestamps the lists resolved, on the title's GPU clock.
++        CRITICAL_READBACK[0].fetch_add(card_elapsed, Ordering::Relaxed);
++        CRITICAL_READBACK[1].fetch_add(shadow_elapsed, Ordering::Relaxed);
++        CRITICAL_READBACK[2].fetch_add(explicit_started.elapsed().as_micros() as u64, Ordering::Relaxed);
++        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
++        // Host timestamps the lists resolved, on the title's GPU clock.
+         let mut clock = None;
+         for list in runs {
+@@ -3526,7 +3536,9 @@
+             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+         });
+-        let [back_ms, back_mb] = [0, 1].map(|i| {
+-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+-        });
++        let [back_ms, back_mb] = [0, 1].map(|i| {
++            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
++        });
++        let [card_back, shadow_back, explicit_back] =
++            CRITICAL_READBACK.each_ref().map(|v| v.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+         let [plans_ms, records_ms] =
+             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+@@ -3550,6 +3562,8 @@
+             log_gpu_times();
+             crate::timeline::log_perf();
+-            crate::shadow::log_sparse_perf();
+-            tracing::info!(
++            crate::shadow::log_sparse_perf();
++            tracing::info!(card_back_ms = card_back, shadow_back_ms = shadow_back, explicit_back_ms = explicit_back,
++                "readback critical path per frame");
++            tracing::info!(
+                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
+                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
