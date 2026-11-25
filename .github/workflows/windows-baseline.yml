@@ -1,0 +1,29 @@
+name: Windows stability baseline
+on:
+  push:
+    branches: [windows-stability-baseline]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build upstream release
+        run: cargo build --release -p victory
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item target/release/victory.exe dist/
+          Copy-Item scripts dist/scripts -Recurse
+          Copy-Item README.md,LICENSE dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ztrx-windows-baseline
+          path: dist/
+          if-no-files-found: error
