@@ -1,7 +1,7 @@
-name: Belobug AMD texture staging experimental
+name: AMD memory and GPU balance experimental
 on:
   push:
-    branches: [amd-render-baseline]
+    branches: [amd-memory-gpu-balance]
     paths:
       - '.github/workflows/belobug-texture-experimental.yml'
       - 'belobug-texture-patches/**'
@@ -59,12 +59,23 @@ jobs:
           EXPERIMENTAL - AMD hardware validation pending.
           Shader translator unchanged. Optional texture history (VICTORY_TEXTURE_HISTORY=1).
           Reuse of baseline shader cache via VICTORY_SHADER_BUILD_OF is supported.
-          Staging scratch buffer reuses initialized memory.
+          Snapshot pools default to 384 MiB each (previously 512 MiB each).
+          Card VRAM budget threshold defaults to 80% (previously 75%); absolute cap unchanged.
+          Card buffers and tile snapshot pools are reported in memory diagnostics.
+          Optional VICTORY_ASYNC_SUBMIT=1 uses existing dependency-checked async submission.
+          Use gpu-balance.ps1 to enable the experimental environment preset.
           See README.md and source-info.json.
           '@ | Set-Content dist/EXPERIMENTAL.txt -Encoding utf8
+          @'
+          $env:VICTORY_GPU_UPLOAD = '1'
+          $env:VICTORY_CARD_BUDGET_PERCENT = '80'
+          $env:VICTORY_SNAPSHOT_POOL_MB = '384'
+          $env:VICTORY_TILE_SNAPSHOT_MB = '384'
+          $env:VICTORY_ASYNC_SUBMIT = '1'
+          '@ | Set-Content dist/gpu-balance.ps1 -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: belobug-texture-71652a2-EXPERIMENTAL
+          name: amd-memory-gpu-balance-EXPERIMENTAL
           path: dist/
           if-no-files-found: error
       - name: Run workspace tests (results may fail on hosted GPU)
