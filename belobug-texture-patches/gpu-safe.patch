@@ -1,0 +1,19 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -737,8 +737,13 @@
+     let bucket = [200, 1000, 3000, 10_000, 30_000].iter().position(|&m| us < m).unwrap_or(5);
+     waits.0[bucket].0 += 1;
+     waits.0[bucket].1 += us;
+-    if us >= 3000 {
+-        let mut pipelines: Vec<String> = runs
++    // Detailed pipeline attribution clones and sorts strings in the submission
++    // hot path. Preserve aggregate wait timings even when attribution is off.
++    static DETAILS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if us >= 3000 && *DETAILS.get_or_init(|| {
++        std::env::var_os("VICTORY_GPU_WAIT_DETAILS").is_some_and(|v| v == "1")
++    }) {
++        let mut pipelines: Vec<String> = runs
+             .iter()
+             .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+             .collect();
