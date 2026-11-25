@@ -119,7 +119,7 @@ internal sealed class Launcher : Form {
             string marker=Path.Combine(root,"cache","warm-"+hash+".ready");
             if(!File.Exists(marker)) {
                 Status("Preparando shaders. Isso pode levar varios minutos; acompanhe o log.");
-                int warmed = await Task.Run(() => Run(exe,"warm \""+Path.GetDirectoryName(title)+"\" --jobs 6",title,"shaders"));
+                int warmed = await Task.Run(() => Run(exe,WarmArguments(title),title,"shaders"));
                 if(cancelled) { Status("Teste encerrado."); return; }
                 if(warmed != 0) { Status("A preparacao encerrou com codigo 0x"+unchecked((uint)warmed).ToString("X8")+". O log continua disponivel."); return; }
                 File.WriteAllText(marker,DateTime.UtcNow.ToString("o"));
@@ -136,6 +136,16 @@ internal sealed class Launcher : Form {
             child=null; busy=false;
             if(!IsDisposed) { start.Enabled=true; browse.Enabled=true; game.Enabled=true; mode.Enabled=true; stop.Enabled=false; }
         }
+    }
+
+    static string WarmArguments(string title) {
+        string folder=Path.GetDirectoryName(title);
+        string result="warm";
+        foreach(string path in new string[] { Path.Combine(folder,"shaders.rpf"), title, Path.Combine(folder,"XboxBvhBuilder.dll"), Path.Combine(folder,"amd_fidelityfx_upscaler_xbox.dll") }) {
+            if(!File.Exists(path)) throw new FileNotFoundException("Arquivo de shaders ausente.",path);
+            result+=" \""+path+"\"";
+        }
+        return result+" --jobs 6";
     }
 
     string PrepareRuntime(string title) {
