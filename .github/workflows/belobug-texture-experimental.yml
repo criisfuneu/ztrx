@@ -1,7 +1,7 @@
-name: Belobug AMD texture staging experimental
+name: AMD loading and streaming experimental
 on:
   push:
-    branches: [amd-render-baseline]
+    branches: [amd-loading-streaming-experimental]
     paths:
       - '.github/workflows/belobug-texture-experimental.yml'
       - 'belobug-texture-patches/**'
@@ -60,11 +60,14 @@ jobs:
           Shader translator unchanged. Optional texture history (VICTORY_TEXTURE_HISTORY=1).
           Reuse of baseline shader cache via VICTORY_SHADER_BUILD_OF is supported.
           Staging scratch buffer reuses initialized memory.
+          Storage worker count defaults to half of logical CPU capacity; set VICTORY_DSTORAGE_WORKERS to compare.
+          Aggregate storage throughput and queue activity are logged at INFO.
+          No changes to title scripts, video playback or mission sequencing.
           See README.md and source-info.json.
           '@ | Set-Content dist/EXPERIMENTAL.txt -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: belobug-texture-71652a2-EXPERIMENTAL
+          name: amd-loading-streaming-EXPERIMENTAL
           path: dist/
           if-no-files-found: error
       - name: Run workspace tests (results may fail on hosted GPU)
