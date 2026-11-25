@@ -39,6 +39,7 @@ internal sealed class Launcher : Form {
     bool busy;
     readonly bool belobug;
     string latestLog;
+    string CacheRoot { get { return Path.Combine(root, belobug ? "cache-belobug-71652a2" : "cache"); } }
 
     public Launcher() {
         string sourceInfo=Path.Combine(root,"source-info.json");
@@ -62,7 +63,7 @@ internal sealed class Launcher : Form {
         }};
         mode.DropDownStyle = ComboBoxStyle.DropDownList;
         mode.Items.AddRange(new object[] { "Series S - menor carga", "Series X" });
-        mode.SelectedIndex = belobug ? 1 : 0;
+        mode.SelectedIndex = 1;
         mode.SetBounds(20, 119, 220, 30);
         start.Text = "Iniciar";
         start.SetBounds(252, 117, 108, 34);
@@ -114,12 +115,12 @@ internal sealed class Launcher : Form {
         busy=true; cancelled=false; start.Enabled=false; browse.Enabled=false; game.Enabled=false; mode.Enabled=false; stop.Enabled=true;
         try {
             Directory.CreateDirectory(Path.Combine(root,"logs"));
-            Directory.CreateDirectory(Path.Combine(root,"cache"));
+            Directory.CreateDirectory(CacheRoot);
             Directory.CreateDirectory(Path.Combine(root,"data"));
             string runtimeTitle = await Task.Run(() => PrepareRuntime(title));
             string hash;
             using(SHA256 sha=SHA256.Create()) using(FileStream file=File.OpenRead(exe)) hash=BitConverter.ToString(sha.ComputeHash(file)).Replace("-","").Substring(0,16);
-            string marker=Path.Combine(root,"cache","warm-"+hash+".ready");
+            string marker=Path.Combine(CacheRoot,"warm-"+hash+".ready");
             if(!belobug && !File.Exists(marker)) {
                 Status("Preparando shaders. Isso pode levar varios minutos; acompanhe o log.");
                 int warmed = await Task.Run(() => Run(exe,WarmArguments(title),title,"shaders"));
@@ -186,7 +187,7 @@ internal sealed class Launcher : Form {
         info.EnvironmentVariables.Keys.CopyTo(inherited,0);
         foreach(string key in inherited) if(key.StartsWith("VICTORY_",StringComparison.OrdinalIgnoreCase)) info.EnvironmentVariables.Remove(key);
         info.EnvironmentVariables["VICTORY_GAME_DIR"]=Path.GetDirectoryName(title);
-        info.EnvironmentVariables["VICTORY_CACHE_DIR"]=Path.Combine(root,"cache");
+        info.EnvironmentVariables["VICTORY_CACHE_DIR"]=CacheRoot;
         info.EnvironmentVariables["VICTORY_DATA_DIR"]=Path.Combine(root,"data");
         info.EnvironmentVariables["VICTORY_LOG"]="info";
         if(belobug) {
