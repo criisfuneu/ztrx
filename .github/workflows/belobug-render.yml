@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         working-directory: runtime
         run: |
-          cargo test --locked --workspace --features diagnostics --profile diag
+          cargo test --locked --workspace --features diagnostics --profile diag --no-fail-fast
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build optimized diagnostics renderer
         shell: pwsh
@@ -65,7 +65,8 @@ jobs:
             upstream_repository = 'Belobug/VIctory-Belobug-AMD'
             upstream_commit = '71652a2c15a0da68cd801890e1f71109670f9ca5'
             patches = @()
-            local_fixes = @('separate-title-runtime-and-asset-roots')
+            local_fixes = @('separate-title-runtime-and-asset-roots', 'valid-mutable-test-storage', 'whole-reservation-unmap-and-alias-fallback', 'split-large-shader-source')
+            patch_files = @(Get-ChildItem belobug-patches/*.patch | Sort-Object Name | Select-Object -ExpandProperty Name)
             control_commit = $env:GITHUB_SHA
             run_id = $env:GITHUB_RUN_ID
             binary_sha256 = (Get-FileHash dist/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -77,38 +78,3 @@ jobs:
           name: victory-belobug-cris-71652a2
           path: dist/
           if-no-files-found: error
-      - name: Make verified delivery available
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $deliveryBranch = 'belo-build-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT
-          Compress-Archive -Path dist/* -DestinationPath "$env:RUNNER_TEMP/victory-belobug-cris.zip" -Force
-          $bytes = [IO.File]::ReadAllBytes("$env:RUNNER_TEMP/victory-belobug-cris.zip")
-          $text = [Convert]::ToBase64String($bytes)
-          New-Item -ItemType Directory -Force build-output | Out-Null
-          $names = @()
-          for ($i = 0; $i -lt $text.Length; $i += 131072) {
-            $name = 'chunk-' + ([int]($i / 131072)).ToString('D4') + '.txt'
-            [IO.File]::WriteAllText((Join-Path (Get-Location) "build-output/$name"), $text.Substring($i, [Math]::Min(131072, $text.Length - $i)), [Text.Encoding]::ASCII)
-            $names += $name
-          }
-          [ordered]@{
-            file_name = 'victory-belobug-cris.zip'
-            size_bytes = $bytes.Length
-            sha256 = (Get-FileHash "$env:RUNNER_TEMP/victory-belobug-cris.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-            binary_sha256 = (Get-FileHash dist/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-            chunks = $names
-            source_commit = '71652a2c15a0da68cd801890e1f71109670f9ca5'
-          } | ConvertTo-Json -Depth 4 | Set-Content build-output/manifest.json -Encoding utf8
-          git config user.name 'criisfuneu'
-          git config user.email '347959980+criisfuneu@users.noreply.github.com'
-          $env:GIT_INDEX_FILE = Join-Path $env:RUNNER_TEMP 'belo-delivery.index'
-          git read-tree --empty
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot create delivery index' }
-          git -c core.autocrlf=false add -- build-output
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot stage delivery' }
-          $deliveryTree = git write-tree
-          $deliveryCommit = git commit-tree $deliveryTree -m "Verified AMD build delivery for run $env:GITHUB_RUN_ID"
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot commit delivery' }
-          git push origin "$($deliveryCommit):refs/heads/$deliveryBranch"
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot publish delivery' }
