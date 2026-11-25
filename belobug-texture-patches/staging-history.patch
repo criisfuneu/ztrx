@@ -316,7 +316,7 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
 +            .and_then(|v| v.parse::<usize>().ok())
 +            .filter(|&v| v <= 512)
 +            .map(|v| v * (1 << 20) / PAGE)
-+            .unwrap_or(TILE_POOL_MOST * 3 / 4)
++            .unwrap_or(TILE_POOL_MOST)
 +    })
 +}
  
@@ -333,7 +333,7 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
      let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
      for v in all {
 -        if pool.len() < TILE_POOL_MOST && v.capacity() >= PAGE {
-+        if pool.len() < tile_pool_limit() && v.capacity() == PAGE {
++        if pool.len() < tile_pool_limit() && v.capacity() >= PAGE {
              pool.push(v);
          }
      }
@@ -377,7 +377,7 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
 +            .and_then(|v| v.parse::<usize>().ok())
 +            .filter(|&v| v <= 512)
 +            .map(|v| v << 20)
-+            .unwrap_or(POOL_BYTES * 3 / 4)
++            .unwrap_or(POOL_BYTES)
 +    })
 +}
  
@@ -416,7 +416,7 @@ diff --git a/crates/victory-gpu/src/card.rs b/crates/victory-gpu/src/card.rs
 +        std::env::var("VICTORY_CARD_BUDGET_PERCENT").ok()
 +            .and_then(|v| v.parse::<u64>().ok())
 +            .filter(|&v| (50..=85).contains(&v))
-+            .unwrap_or(80)
++            .unwrap_or(75)
 +    })
 +}
  
