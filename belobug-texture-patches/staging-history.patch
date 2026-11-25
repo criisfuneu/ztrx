@@ -302,7 +302,7 @@ diff --git a/crates/victory-gpu/src/copystat.rs b/crates/victory-gpu/src/copysta
 diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
 --- a/crates/victory-gpu/src/shadow.rs
 +++ b/crates/victory-gpu/src/shadow.rs
-@@ -136,7 +136,18 @@
+@@ -136,61 +136,86 @@
  static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
  
  /// Tile snapshots kept at most (512 MiB).
@@ -322,7 +322,13 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
  
  /// An empty buffer with room for a tile.
  fn pooled_tile() -> Vec<u8> {
-@@ -150,7 +161,7 @@
+     let kept = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+     let mut v = kept.unwrap_or_else(|| Vec::with_capacity(PAGE));
+     v.clear();
+     v
+ }
+ 
+ /// Returns tile snapshots to their pool.
  fn give_back_tiles(all: impl Iterator<Item = Vec<u8>>) {
      let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
      for v in all {
@@ -331,7 +337,21 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
              pool.push(v);
          }
      }
-@@ -172,9 +183,12 @@
+ }
+ 
+ /// Of sparse copies shaders write: bytes declared, bytes of snapshots taken,
+ /// bytes compared after and bytes of those that differed.
+ #[cfg(feature = "diagnostics")]
+ static SPARSE_WRITES: [std::sync::atomic::AtomicU64; 4] =
+     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+ 
+ /// Logs and resets the counts above.
+ #[cfg(feature = "diagnostics")]
+ pub(crate) fn sparse_writes_text() -> String {
+     let [declared, taken, compared, differed] =
+         [0, 1, 2, 3].map(|i| SPARSE_WRITES[i].swap(0, Ordering::Relaxed) as f64 / 1e6);
+     format!("declared {declared:.1} MB, snapshots {taken:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB")
+ }
  
  /// Bytes of the snapshot memory kept for reuse.
  pub(crate) fn pool_bytes() -> u64 {
@@ -344,10 +364,6 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
 +        .iter().map(|v| v.capacity() as u64).sum();
 +    ordinary + tiles
 +}
- 
- /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
- /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
-@@ -178,7 +192,18 @@
  
  /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
  /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
@@ -367,7 +383,11 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
  
  /// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
  /// and no more than [`POOL_BYTES`] in all).
-@@ -190,7 +215,7 @@
+ fn give_back(v: Vec<u8>) {
+     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+     pool.push(v);
+     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+     pool.truncate(8);
      let mut total = 0;
      pool.retain(|v| {
          total += v.capacity();
@@ -375,6 +395,7 @@ diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
 +        total <= snapshot_pool_limit()
      });
  }
+ 
 diff --git a/crates/victory-gpu/src/card.rs b/crates/victory-gpu/src/card.rs
 --- a/crates/victory-gpu/src/card.rs
 +++ b/crates/victory-gpu/src/card.rs
