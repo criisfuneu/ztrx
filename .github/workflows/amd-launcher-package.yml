@@ -1,0 +1,51 @@
+name: Package AMD shader preparation fix
+on:
+  push:
+    branches: [amd-render-baseline]
+    paths: ['.github/workflows/amd-launcher-package.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: victory-amd-cris-003beef
+          run-id: 45610142668
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist
+      - name: Build and package shader preparation fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = '06492902972931c97de9e9143ad32dad43de139ec21f72bd829b18283a89634c'
+          $actual = (Get-FileHash dist/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'Unexpected renderer executable' }
+          Copy-Item launcher/Launcher.cs dist/Launcher.cs -Force
+          $csc = Join-Path $env:SystemRoot 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+          $launcherSource = (Resolve-Path -LiteralPath '.\launcher\Launcher.cs').Path
+          $launcherOutput = Join-Path (Get-Location) 'dist\Iniciar-AMD.exe'
+          & $csc /nologo /target:winexe /platform:x64 /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll "/out:$launcherOutput" $launcherSource
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher build failed' }
+          $info = Get-Content dist/source-info.json -Raw | ConvertFrom-Json
+          $info | Add-Member -NotePropertyName launcher_commit -NotePropertyValue $env:GITHUB_SHA -Force
+          $info | Add-Member -NotePropertyName warm_mode -NotePropertyValue 'translate-only; create needed driver pipelines during gameplay' -Force
+          $info | ConvertTo-Json -Depth 5 | Set-Content dist/source-info.json -Encoding utf8
+          @'
+          Abra Iniciar-AMD.exe.
+          Extraia sobre a pasta do teste anterior para reutilizar os shaders ja traduzidos.
+          A preparacao traduz os shaders; os pipelines do driver sao feitos quando usados pelo jogo.
+          Os logs permanecem na pasta logs.
+          '@ | Set-Content dist/COMO-INICIAR.txt -Encoding utf8
+          & ./dist/victory.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Renderer startup check failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-amd-cris-shaderfix
+          path: dist/
+          if-no-files-found: error
