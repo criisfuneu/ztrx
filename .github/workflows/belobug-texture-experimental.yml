@@ -1,7 +1,7 @@
-name: AMD Bindless Card diagnostics experiment
+name: AMD Sparse Readback and Compute diagnostics
 on:
   push:
-    branches: [amd-bindless-card-experimental]
+    branches: [amd-sparse-readback-compute]
     paths:
       - '.github/workflows/belobug-texture-experimental.yml'
       - 'belobug-texture-patches/**'
@@ -42,6 +42,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply ../belobug-texture-patches/bindless-card-telemetry.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply --check ../belobug-texture-patches/sparse-readback-compute.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply ../belobug-texture-patches/sparse-readback-compute.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:CARGO_PROFILE_DIAG_LTO = 'thin'
           $env:CARGO_PROFILE_DIAG_CODEGEN_UNITS = '1'
           cargo build --locked --profile diag -p victory --features diagnostics
@@ -54,11 +58,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item runtime/target/diag/victory.exe,runtime/README.md,runtime/LICENSE dist/
-          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch dist/
+          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch,belobug-texture-patches/sparse-readback-compute.patch dist/
           $manifest = [ordered]@{
             upstream_repository = 'Belobug/VIctory-Belobug-AMD'
             upstream_commit = '71652a2c15a0da68cd801890e1f71109670f9ca5'
-            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch')
+            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch','sparse-readback-compute.patch')
             codegen = 'Thin LTO, one codegen unit for diag build'
             validation = 'Build and CLI smoke test only at packaging; hardware validation pending. Workspace tests reported separately in this run.'
             control_commit = $env:GITHUB_SHA
@@ -76,7 +80,9 @@ jobs:
           Detailed wait attribution is opt-in via VICTORY_GPU_WAIT_DETAILS=1.
           Card buffers and tile snapshot pools are reported in memory diagnostics.
           Bindless range merging compacts in place; card admissions report rejection reasons.
-          Sparse heap residency and shader translation are unchanged in this isolated experiment.
+          Persistent sparse tile mappings are reused during readback only with sweeping disabled.
+          Compute SGPR failures report native root parameter layouts; unsupported instructions remain refused.
+          Sparse heap residency and shader translation semantics are unchanged.
           Async submission is disabled in the preset following a device-hung regression.
           Use gpu-balance.ps1 to enable the experimental environment preset.
           See README.md and source-info.json.
@@ -91,7 +97,7 @@ jobs:
           '@ | Set-Content dist/gpu-balance.ps1 -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: amd-bindless-card-EXPERIMENTAL
+          name: amd-sparse-readback-compute-EXPERIMENTAL
           path: dist/
           if-no-files-found: error
       - name: Run workspace tests (results may fail on hosted GPU)
