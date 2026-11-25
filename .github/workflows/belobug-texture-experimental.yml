@@ -1,7 +1,7 @@
-name: AMD Performance V9 Final AVX2
+name: AMD Performance V10 GPU Feed
 on:
   push:
-    branches: [amd-performance-core-v9-final]
+    branches: [amd-performance-core-v10-feed]
     paths:
       - '.github/workflows/belobug-texture-experimental.yml'
       - 'belobug-texture-patches/**'
@@ -70,6 +70,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply ../belobug-texture-patches/performance-core-v9-final.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply --check ../belobug-texture-patches/performance-core-v10-feed.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply ../belobug-texture-patches/performance-core-v10-feed.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:CARGO_PROFILE_RELEASE_LTO = 'thin'
           $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '1'
           cargo build --locked --release -p victory
@@ -82,11 +86,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item runtime/target/release/victory.exe,runtime/README.md,runtime/LICENSE dist/
-          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch,belobug-texture-patches/performance-core.patch,belobug-texture-patches/performance-core-v2.patch,belobug-texture-patches/performance-core-v3.patch,belobug-texture-patches/performance-core-v4.patch,belobug-texture-patches/performance-core-v7-lean.patch,belobug-texture-patches/performance-core-v8-scaling.patch,belobug-texture-patches/performance-core-v9-final.patch dist/
+          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch,belobug-texture-patches/performance-core.patch,belobug-texture-patches/performance-core-v2.patch,belobug-texture-patches/performance-core-v3.patch,belobug-texture-patches/performance-core-v4.patch,belobug-texture-patches/performance-core-v7-lean.patch,belobug-texture-patches/performance-core-v8-scaling.patch,belobug-texture-patches/performance-core-v9-final.patch,belobug-texture-patches/performance-core-v10-feed.patch dist/
           $manifest = [ordered]@{
             upstream_repository = 'Belobug/VIctory-Belobug-AMD'
             upstream_commit = '71652a2c15a0da68cd801890e1f71109670f9ca5'
-            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch','performance-core.patch','performance-core-v2.patch','performance-core-v3.patch','performance-core-v4.patch','performance-core-v7-lean.patch','performance-core-v8-scaling.patch','performance-core-v9-final.patch')
+            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch','performance-core.patch','performance-core-v2.patch','performance-core-v3.patch','performance-core-v4.patch','performance-core-v7-lean.patch','performance-core-v8-scaling.patch','performance-core-v9-final.patch','performance-core-v10-feed.patch')
             codegen = 'Release, Thin LTO, one codegen unit; no diagnostics feature'
             validation = 'Build and CLI smoke test only at packaging; hardware validation pending. Workspace tests reported separately in this run.'
             control_commit = $env:GITHUB_SHA
@@ -121,6 +125,7 @@ jobs:
           Completed fences skip the event wait; main queue calls, lock and fence time are reported.
           Optional batch GPU timestamps: VICTORY_GPU_TIMING_BATCH=1 plus VICTORY_D3D12_DRED=1.
           Timestamp mode reports command durations, not hardware utilization; it adds instrumentation.
+          V10: incremental released descriptor generations with bounded full-scan fallback, canonical sparse read roots, conservative mesh output count tightening, fixed FSR test initializer. Root spill translation is opt-in (-SpillExperimental), may hang on incomplete BVH chains. No ray tracing or async enabled. New shader cache fingerprint. No performance measured.
           Async submission is disabled in the preset following a device-hung regression.
           Use gpu-balance.ps1 to enable the experimental environment preset.
           See README.md and source-info.json.
@@ -148,10 +153,12 @@ jobs:
           param(
               [Parameter(Mandatory=$true)][string]$GameExe,
               [ValidateSet('QUALITY','PERFORMANCE')][string]$Profile = 'PERFORMANCE',
-              [string]$FfxDir
+              [string]$FfxDir,
+              [switch]$SpillExperimental
           )
           $ErrorActionPreference = 'Stop'
           . "$PSScriptRoot\gpu-balance.ps1"
+          $env:VICTORY_PERF_UNSPILL = if ($SpillExperimental) { '1' } else { '0' }
           $env:VICTORY_HAIR = '1'
           $env:VICTORY_TEXTURE_HISTORY = '0'
           Remove-Item Env:VICTORY_PRESENT_TARGET,Env:VICTORY_FFX_DIR -ErrorAction SilentlyContinue
@@ -167,11 +174,11 @@ jobs:
               $console = 'series-x'
           }
           $ErrorActionPreference = 'Continue'
-          & "$PSScriptRoot\victory.exe" run $GameExe --execute --console $console 2>&1 | Tee-Object -FilePath "$PSScriptRoot\victory-v8-$Profile.log"
-          '@ | Set-Content dist/Iniciar-V8.ps1 -Encoding utf8
+          & "$PSScriptRoot\victory.exe" run $GameExe --execute --console $console 2>&1 | Tee-Object -FilePath "$PSScriptRoot\victory-v10-$Profile.log"
+          '@ | Set-Content dist/Iniciar-V10.ps1 -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: amd-performance-core-v9-FINAL-AVX2
+          name: amd-performance-core-v10-GPU-FEED
           path: dist/
           if-no-files-found: error
       - name: Run workspace tests (results may fail on hosted GPU)
