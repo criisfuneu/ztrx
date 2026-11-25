@@ -1,0 +1,125 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -692,12 +692,13 @@
+             return 0;
+         }
+-        let mut busy: Vec<(usize, usize)> = self
+-            .pending
+-            .lock()
+-            .unwrap_or_else(|e| e.into_inner())
+-            .iter()
+-            .copied()
+-            .filter(|&(a, e)| a < to && e > from)
+-            .collect();
++        let mut busy: Vec<(usize, usize)> = {
++            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
++            // A single pending write fully covering the refresh already
++            // makes the original gap loop return zero. No allocation/sort.
++            if pending.iter().any(|&(a, e)| a <= from && e >= to) {
++                return 0;
++            }
++            pending.iter().copied().filter(|&(a, e)| a < to && e > from).collect()
++        };
+         if !busy.is_empty() {
+             // Around ranges shaders are writing: the gaps, each as below
+@@ -2218,9 +2219,94 @@
+ 
+ /// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
+-fn merge_gpu_writes_mut(
+-    title: &mut [u8],
+-    host: &mut [u8],
+-    old: &mut [u8],
+-) -> Option<(usize, usize)> {
++fn merge_gpu_writes_mut(
++    title: &mut [u8],
++    host: &mut [u8],
++    old: &mut [u8],
++) -> Option<(usize, usize)> {
++    #[cfg(target_arch = "x86_64")]
++    if v9_avx2_merge() {
++        // SAFETY: AVX2 detected at runtime; the slices are disjoint and
++        // the implementation bounds each unaligned 32-byte access.
++        return unsafe { merge_gpu_writes_avx2(title, host, old) };
++    }
++    merge_gpu_writes_mut_scalar(title, host, old)
++}
++
++#[cfg(target_arch = "x86_64")]
++fn v9_avx2_merge() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var_os("VICTORY_PERF_AVX2_MERGE").is_some_and(|v| v == "1")
++            && std::arch::is_x86_feature_detected!("avx2");
++        tracing::info!(on, "V9 AVX2 exact memory merge");
++        on
++    })
++}
++
++#[cfg(target_arch = "x86_64")]
++#[target_feature(enable = "avx2")]
++unsafe fn merge_gpu_writes_avx2(
++    title: &mut [u8],
++    host: &mut [u8],
++    old: &mut [u8],
++) -> Option<(usize, usize)> {
++    use std::arch::x86_64::*;
++    let n = title.len().min(host.len()).min(old.len());
++    let mut first = usize::MAX;
++    let mut last = 0usize;
++    let mut i = 0usize;
++    // SAFETY: each access is within all three exclusive slices, and
++    // the caller has checked the CPU supports AVX2.
++    unsafe {
++        while i + 32 <= n {
++            let h = _mm256_loadu_si256(host.as_ptr().add(i).cast());
++            let o = _mm256_loadu_si256(old.as_ptr().add(i).cast());
++            let t = _mm256_loadu_si256(title.as_ptr().add(i).cast());
++            let equal = _mm256_cmpeq_epi8(h, o);
++            // GPU wins exactly where it changed relative to the snapshot;
++            // elsewhere keep the CPU's potentially concurrent update.
++            let merged = _mm256_blendv_epi8(h, t, equal);
++            let mask = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(merged, t)) as u32);
++            if mask != 0 {
++                first = first.min(i + mask.trailing_zeros() as usize);
++                last = i + (32 - mask.leading_zeros()) as usize;
++                _mm256_storeu_si256(title.as_mut_ptr().add(i).cast(), merged);
++            }
++            _mm256_storeu_si256(host.as_mut_ptr().add(i).cast(), merged);
++            _mm256_storeu_si256(old.as_mut_ptr().add(i).cast(), merged);
++            i += 32;
++        }
++    }
++    if let Some((a, b)) = merge_gpu_writes_mut_scalar(&mut title[i..n], &mut host[i..n], &mut old[i..n]) {
++        first = first.min(i + a);
++        last = i + b;
++    }
++    (first < last).then_some((first, last))
++}
++
++#[cfg(all(test, target_arch = "x86_64"))]
++#[test]
++fn v9_avx2_merge_matches_scalar() {
++    if !std::arch::is_x86_feature_detected!("avx2") { return; }
++    for n in [0usize, 1, 7, 31, 32, 33, 63, 64, 129, 4096, 65536] {
++        for stride in [1usize, 7, 31, 32, 67, 257] {
++            let mut t: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(19)) as u8).collect();
++            let mut o = t.clone();
++            let mut h = o.clone();
++            for i in (0..n).step_by(stride) { h[i] ^= 0x5a; }
++            for i in (0..n).step_by(stride + 1) { t[i] ^= 0xa5; }
++            let (mut tr, mut hr, mut or_) = (t.clone(), h.clone(), o.clone());
++            let expected = merge_gpu_writes_mut_scalar(&mut tr, &mut hr, &mut or_);
++            let actual = unsafe { merge_gpu_writes_avx2(&mut t, &mut h, &mut o) };
++            assert_eq!((actual, t, h, o), (expected, tr, hr, or_));
++        }
++    }
++}
++
++fn merge_gpu_writes_mut_scalar(
++    title: &mut [u8],
++    host: &mut [u8],
++    old: &mut [u8],
++) -> Option<(usize, usize)> {
+     let n = title.len().min(host.len()).min(old.len());
+     let mut first = usize::MAX;
