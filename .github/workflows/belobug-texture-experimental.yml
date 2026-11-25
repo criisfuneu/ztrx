@@ -1,7 +1,7 @@
-name: AMD Performance Scaling V8 LEAN
+name: AMD V9 Strict RX 9070 XT
 on:
   push:
-    branches: [amd-performance-core-v8-scaling]
+    branches: [amd-performance-core-v9-9070xt]
     paths:
       - '.github/workflows/belobug-texture-experimental.yml'
       - 'belobug-texture-patches/**'
@@ -66,6 +66,46 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply ../belobug-texture-patches/performance-core-v8-scaling.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hostFile = 'crates/victory-gpu/src/host.rs'
+          $hostSource = Get-Content -LiteralPath $hostFile -Raw
+          $hostSource = $hostSource.Replace("`r`n", "`n")
+          $start = $hostSource.IndexOf('        // Diagnostics: the software adapter,')
+          $end = $hostSource.IndexOf('        let device = device.ok_or_else', $start)
+          if ($start -lt 0 -or $end -le $start) { throw 'V9 host creation context missing' }
+          $hostSource = $hostSource.Substring(0,$start) + @'
+                  let adapter = fastest_adapter()?;
+                  D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+          '@ + "`n" + $hostSource.Substring($end)
+          $start = $hostSource.IndexOf('fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {')
+          $end = $hostSource.IndexOf('/// DXGI may return hardware for', $start)
+          if ($start -lt 0 -or $end -le $start) { throw 'V9 adapter selection context missing' }
+          $hostSource = $hostSource.Substring(0,$start) + @'
+          fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
+              unsafe {
+                  let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+                  for index in 0..32u32 {
+                      let adapter: IDXGIAdapter1 = match factory.EnumAdapterByGpuPreference(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
+                          Ok(adapter) => adapter,
+                          Err(_) => break,
+                      };
+                      let desc = adapter.GetDesc1()?;
+                      let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                      let name = String::from_utf16_lossy(&desc.Description[..end]);
+                      let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                      let selected = !software && desc.VendorId == 0x1002 && name.to_ascii_lowercase().contains("9070 xt") && (desc.DedicatedVideoMemory >> 20) >= 12288;
+                      tracing::info!(%name, vendor = desc.VendorId, device_id = desc.DeviceId, vram_mb = desc.DedicatedVideoMemory >> 20, software, selected, "V9 adapter candidate");
+                      if selected {
+                          tracing::info!(%name, vram_mb = desc.DedicatedVideoMemory >> 20, "V9 strict RX 9070 XT host adapter");
+                          return Ok(adapter);
+                      }
+                  }
+                  tracing::error!("V9 requires a discrete Radeon RX 9070 XT; refusing integrated and software adapters");
+                  Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+              }
+          }
+
+          '@ + "`n" + $hostSource.Substring($end)
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $hostFile), $hostSource, [System.Text.UTF8Encoding]::new($false))
           $env:CARGO_PROFILE_RELEASE_LTO = 'thin'
           $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '1'
           cargo build --locked --release -p victory
@@ -92,6 +132,7 @@ jobs:
           $manifest | ConvertTo-Json -Depth 4 | Set-Content dist/source-info.json -Encoding utf8
           @'
           EXPERIMENTAL - AMD hardware validation pending.
+          V9: strict RX 9070 XT adapter enumeration, no runtime WARP or default-adapter fallback. No verified FPS gain. Async remains disabled pending analysis.
           Shader translator unchanged. Optional texture history (VICTORY_TEXTURE_HISTORY=1).
           Reuse of baseline shader cache via VICTORY_SHADER_BUILD_OF is supported.
           Snapshot pools default to the original 512 MiB each.
@@ -122,12 +163,13 @@ jobs:
           See README.md and source-info.json.
           '@ | Set-Content dist/EXPERIMENTAL.txt -Encoding utf8
           @'
+          Remove-Item Env:VICTORY_D3D12_WARP -ErrorAction SilentlyContinue
           $env:VICTORY_GPU_UPLOAD = '1'
           $env:VICTORY_CARD_BUDGET_PERCENT = '75'
           $env:VICTORY_SNAPSHOT_POOL_MB = '512'
           $env:VICTORY_TILE_SNAPSHOT_MB = '512'
           $env:VICTORY_ASYNC_SUBMIT = '0'
-          $env:VICTORY_GPU_WAIT_DETAILS = '0'
+          $env:VICTORY_GPU_WAIT_DETAILS = '1'
           $env:VICTORY_PERF_PARALLEL_REFRESH = '1'
           $env:VICTORY_PERF_LOCAL_QUEUE = '1'
           $env:VICTORY_PERF_SPARSE_CACHE = '1'
@@ -162,11 +204,11 @@ jobs:
               $console = 'series-x'
           }
           $ErrorActionPreference = 'Continue'
-          & "$PSScriptRoot\victory.exe" run $GameExe --execute --console $console 2>&1 | Tee-Object -FilePath "$PSScriptRoot\victory-v8-$Profile.log"
-          '@ | Set-Content dist/Iniciar-V8.ps1 -Encoding utf8
+          & "$PSScriptRoot\victory.exe" run $GameExe --execute --console $console 2>&1 | Tee-Object -FilePath "$PSScriptRoot\victory-v9-$Profile.log"
+          '@ | Set-Content dist/Iniciar-V9.ps1 -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: amd-performance-core-v8-SCALING-LEAN
+          name: amd-performance-core-v9-9070XT
           path: dist/
           if-no-files-found: error
       - name: Run workspace tests (results may fail on hosted GPU)
