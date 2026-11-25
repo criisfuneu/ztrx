@@ -1,0 +1,76 @@
+name: Belobug AMD texture staging experimental
+on:
+  push:
+    branches: [amd-render-baseline]
+    paths:
+      - '.github/workflows/belobug-texture-experimental.yml'
+      - 'belobug-texture-patches/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: Belobug/VIctory-Belobug-AMD
+          ref: 71652a2c15a0da68cd801890e1f71109670f9ca5
+          path: runtime
+          persist-credentials: false
+      - name: Verify upstream and compile diagnostics
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = git rev-parse HEAD
+          if ($actual -ne '71652a2c15a0da68cd801890e1f71109670f9ca5') { throw 'Unexpected upstream revision' }
+          git apply --check ../belobug-texture-patches/staging-history.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply ../belobug-texture-patches/staging-history.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --profile diag -p victory --features diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./target/diag/victory.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package experimental executable (GPU validation pending)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item runtime/target/diag/victory.exe,runtime/README.md,runtime/LICENSE dist/
+          Copy-Item belobug-texture-patches/staging-history.patch dist/
+          $manifest = [ordered]@{
+            upstream_repository = 'Belobug/VIctory-Belobug-AMD'
+            upstream_commit = '71652a2c15a0da68cd801890e1f71109670f9ca5'
+            local_runtime_patches = @('staging-history.patch')
+            validation = 'Build and CLI smoke test only at packaging; hardware validation pending. Workspace tests reported separately in this run.'
+            control_commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            binary_sha256 = (Get-FileHash dist/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content dist/source-info.json -Encoding utf8
+          @'
+          EXPERIMENTAL - AMD hardware validation pending.
+          Shader translator unchanged. Optional texture history (VICTORY_TEXTURE_HISTORY=1).
+          Reuse of baseline shader cache via VICTORY_SHADER_BUILD_OF is supported.
+          Staging scratch buffer reuses initialized memory.
+          See README.md and source-info.json.
+          '@ | Set-Content dist/EXPERIMENTAL.txt -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: belobug-texture-71652a2-EXPERIMENTAL
+          path: dist/
+          if-no-files-found: error
+      - name: Run workspace tests (results may fail on hosted GPU)
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $env:RUST_BACKTRACE = '1'
+          cargo test --locked --workspace --features diagnostics --profile diag --no-fail-fast -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

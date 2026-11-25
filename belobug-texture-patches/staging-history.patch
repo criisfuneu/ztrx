@@ -1,0 +1,73 @@
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -332,9 +332,14 @@
+         // Read through our safe copy: the title may unmap the pages
+         // (evicting a texture a big table lists) while we read them.
+         SCRATCH.with_borrow_mut(|tiled| {
+-            tiled.resize(size, 0);
+-            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+-            let read = self.changed(last, tiled, rewritten);
++            // Keep the initialized high-water mark, as in with_tiled_copy.
++            // The copy overwrites the requested prefix; hash only that prefix.
++            if size > tiled.len() {
++                tiled.resize(size, 0);
++            }
++            let tiled_bytes = &mut tiled[..size];
++            crate::host::copy_mapped(tiled_bytes.as_mut_ptr(), self.memory, size, false);
++            let read = self.changed(last, tiled_bytes, rewritten);
+             last.still = if read.1 { 0 } else { (last.still + 1).min(6) };
+             // Not all in the same frame; static textures back off up to 32 frames
+             // (`title_memory_written` resets `still` immediately on streamed writes).
+@@ -459,9 +464,20 @@
+     pub(crate) static VIEWS: Mutex<std::collections::BTreeMap<u64, Vec<([u32; 14], [u32; 16])>>> =
+         Mutex::new(std::collections::BTreeMap::new());
+ 
+-    /// A view of a placed texture.
+-    pub(crate) fn view(address: u64, resource: &[u32; 14], desc: [u32; 16]) {
+-        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
++    /// Expensive texture history is opt-in; never affects upload decisions.
++    fn enabled() -> bool {
++        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ENABLED.get_or_init(|| {
++            std::env::var_os("VICTORY_TEXTURE_HISTORY").is_some_and(|v| v == "1")
++        })
++    }
++
++    /// A view of a placed texture.
++    pub(crate) fn view(address: u64, resource: &[u32; 14], desc: [u32; 16]) {
++        if !enabled() {
++            return;
++        }
++        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+         let list = views.entry(address).or_default();
+         if !list.contains(&(*resource, desc)) && list.len() < 16 {
+             list.push((*resource, desc));
+@@ -468,8 +484,11 @@
+         }
+     }
+ 
+-    pub(super) fn note(s: &Staging, hash: &blake3::Hash, tiled: &[u8], told: bool, again: bool) {
+-        let frame = crate::queue::presented();
++    pub(super) fn note(s: &Staging, hash: &blake3::Hash, tiled: &[u8], told: bool, again: bool) {
++        if !enabled() {
++            return;
++        }
++        let frame = crate::queue::presented();
+         let d = &s.layout.desc;
+         let key = (
+             s.memory as usize,
+@@ -501,8 +520,11 @@
+     }
+ 
+     /// Logs the textures that changed most.
+-    pub(crate) fn log() {
+-        let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    pub(crate) fn log() {
++        if !enabled() {
++            return;
++        }
++        let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+         let Some(seen) = seen.as_ref() else { return };
+         let (mut changed, mut back, mut zero) = (0, 0, 0);
+         for s in seen.values() {
