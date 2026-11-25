@@ -62,7 +62,7 @@ diff --git a/crates/victory-hle/src/modules/mod.rs b/crates/victory-hle/src/modu
 +pub mod dstorage;
  #[cfg(windows)]
  pub mod dualsense;
-@@ -72,6 +74,10 @@
+@@ -72,5 +74,9 @@
      all.push(xmem::module());
      #[cfg(windows)]
 -    all.push(xsystem::module());
@@ -74,7 +74,6 @@ diff --git a/crates/victory-hle/src/modules/mod.rs b/crates/victory-hle/src/modu
 +    }
 +    all
  }
- 
 diff --git a/crates/victory-gpu/src/ffx.rs b/crates/victory-gpu/src/ffx.rs
 new file mode 100644
 --- /dev/null
