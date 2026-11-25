@@ -299,3 +299,40 @@ diff --git a/crates/victory-gpu/src/copystat.rs b/crates/victory-gpu/src/copysta
      let e = map
          .get_or_insert_with(HashMap::new)
          .entry((src, len))
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -420,7 +420,14 @@
+         })
+         .as_ref()?;
+     STARTED.call_once(|| {
+-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
++        let available = std::thread::available_parallelism().map_or(4, |n| n.get());
++        // Reserve CPU capacity for rendering and command preparation.
++        // The original worker count remains selectable for comparison.
++        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
++            .ok()
++            .and_then(|s| s.parse::<usize>().ok())
++            .filter(|&n| n > 0 && n <= available)
++            .unwrap_or_else(|| (available / 2).max(1));
+         let started = (0..workers)
+             .filter(|i| {
+                 std::thread::Builder::new()
+@@ -462,7 +469,7 @@
+ }
+ 
+ impl Lanes {
+-    /// Counts a finished request; every 5 s a debug line sums them up.
++    /// Counts a finished request; every 5 s an info line sums them up.
+     fn count(&mut self, job: &Job, started: std::time::Instant) {
+         let (requests, bytes, busy) = &mut self.done;
+         *requests += 1;
+@@ -477,7 +484,7 @@
+         if elapsed.as_secs() >= 5 {
+             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
+             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+-            tracing::debug!(
++            tracing::info!(
+                 requests = *requests,
+                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
+                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
