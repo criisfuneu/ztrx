@@ -1,0 +1,208 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -156,5 +156,25 @@
+     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+ 
+-/// After submissions: shader-written ranges compared and copied back into
++// Performance Core: lock time, queue calls/time, blocking waits/time,
++ // already-completed fences, parallel refresh batches/ranges.
++static PERF_CORE: [std::sync::atomic::AtomicU64; 8] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
++
++fn perf_add(index: usize, value: u64) {
++    PERF_CORE[index].fetch_add(value, Ordering::Relaxed);
++}
++
++fn perf_parallel_refresh() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_PARALLEL_REFRESH").is_some_and(|v| v == "1"))
++}
++
++fn batch_timing() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| cfg!(feature = "diagnostics") &&
++        std::env::var_os("VICTORY_GPU_TIMING_BATCH").is_some_and(|v| v == "1"))
++}
++
++/// After submissions: shader-written ranges compared and copied back into
+ /// title memory (microseconds, bytes that differed), since the last
+ /// frame-rate line.
+@@ -726,5 +746,5 @@
+ fn timing() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
++    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some() || batch_timing())
+ }
+ 
+@@ -1164,6 +1184,8 @@
+         // One submission at a time from preparation to copy-back: snapshots
+         // and the ranges shaders write are per host copy, not per submission.
+-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+-        // Wait for any previous async submission before mutating shared Shadow
++        let locking = std::time::Instant::now();
++        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
++        perf_add(0, locking.elapsed().as_micros() as u64);
++        // Wait for any previous async submission before mutating shared Shadow
+         // buffers in `prepare`. During the gap between submissions, the GPU
+         // ran in parallel with the title's CPU command-list recording.
+@@ -1258,10 +1280,11 @@
+             .collect();
+         #[cfg(feature = "diagnostics")]
+-        let each = timing();
++        let each = timing() && !batch_timing();
+         #[cfg(not(feature = "diagnostics"))]
+         let each = false;
+         let can_async = !cfg!(test)
+-            && !each
+-            && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
++            && !each
++            && !batch_timing()
++            && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
+             && card_writes.is_empty()
+             && cpu_back.is_empty()
+@@ -1290,6 +1313,8 @@
+             let started = std::time::Instant::now();
+             // SAFETY: closed lists.
+-            unsafe { self.queue.ExecuteCommandLists(group) };
+-            if !each && i + 1 < groups.len() {
++            unsafe { self.queue.ExecuteCommandLists(group) };
++            perf_add(1, 1);
++            perf_add(2, started.elapsed().as_micros() as u64);
++            if !each && i + 1 < groups.len() {
+                 continue;
+             }
+@@ -1315,17 +1340,25 @@
+                 continue;
+             }
+-            // SAFETY: the fence and event are ours.
+-            unsafe {
+-                let waited = self
+-                    .queue
+-                    .Signal(&self.fence, fence_val)
+-                    .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
+-                match waited {
+-                    Ok(()) => {
+-                        WaitForSingleObject(self.event, INFINITE);
+-                    }
+-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+-                }
+-            }
++            // SAFETY: the fence and event are ours; submitted serializes access.
++            unsafe {
++                let wait_started = std::time::Instant::now();
++                match self.queue.Signal(&self.fence, fence_val) {
++                    Ok(()) => {
++                        let completed = self.fence.GetCompletedValue();
++                        // UINT64_MAX means device removal, never successful completion.
++                        if completed != u64::MAX && completed >= fence_val {
++                            perf_add(5, 1);
++                        } else {
++                            perf_add(3, 1);
++                            match self.fence.SetEventOnCompletion(fence_val, self.event) {
++                                Ok(()) => { WaitForSingleObject(self.event, INFINITE); }
++                                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
++                            }
++                        }
++                    }
++                    Err(e) => tracing::warn!(error = %e, "host submission not signalled"),
++                }
++                perf_add(4, wait_started.elapsed().as_micros() as u64);
++            }
+             #[cfg(feature = "diagnostics")]
+             if each {
+@@ -1401,5 +1434,23 @@
+             ));
+         }
+-        // What shaders wrote goes back before the bottom-of-pipe writes,
++        // Optional command timestamps collected after the existing final fence.
++        // No extra per-list wait; repeated list objects can only retain the last
++        // execution's timestamps, so do not count them more than once.
++        #[cfg(feature = "diagnostics")]
++        if batch_timing() && dred_on() && !no_work() {
++            // SAFETY: plain queue/fence queries, under the submission lock.
++            let completed = unsafe { self.fence.GetCompletedValue() };
++            if completed != u64::MAX && completed >= *submitted {
++                if let Ok(frequency) = unsafe { self.queue.GetTimestampFrequency() } {
++                    let mut seen = std::collections::HashSet::new();
++                    for &list in runs {
++                        if seen.insert(std::ptr::from_ref(list) as usize) {
++                            list.add_times(frequency);
++                        }
++                    }
++                }
++            }
++        }
++        // What shaders wrote goes back before the bottom-of-pipe writes,
+         // which tell the title the GPU is done; each range once per
+         // submission, however many dispatches declared it (the world's
+@@ -2700,12 +2751,34 @@
+ 
+     fn flush(&mut self) {
+-        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
+-            update(&shadow, from, to - from);
+-        }
+-        let mut pieces = std::mem::take(&mut self.pieces);
+-        pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
++        // The ordinary refreshes are already coalesced per Shadow.
++        // Parallelize only distinct, nonoverlapping ordinary title spans;
++        // sparse, direct, card, and ambiguous cases keep the original order.
++        let parallel = perf_parallel_refresh()
++            && (8..=64).contains(&self.refreshes.len())
++            && self.refreshes.iter().enumerate().all(|(i, (s, from, to))| {
++                !s.is_direct() && !s.is_sparse() && !s.is_card()
++                    && self.refreshes[..i].iter().all(|(other, a, b)| {
++                        s.root_key() != other.root_key() && (*to <= *a || *b <= *from)
++                    })
++            });
++        if parallel {
++            perf_add(6, 1);
++            perf_add(7, self.refreshes.len() as u64);
++            in_parallel(&self.refreshes, 2, |chunk| {
++                for (shadow, from, to) in chunk {
++                    update(shadow, *from, *to - *from);
++                }
++            });
++            self.refreshes.clear();
++        } else {
++            for (shadow, from, to) in self.refreshes.drain(..) {
++                update(&shadow, from, to - from);
++            }
++        }
++        // Preserve the vector allocation across the frequent flushes.
++        self.pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
+         let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
+-        for (shadow, from, to) in pieces {
+-            if let Some((s, _, end)) = &mut run
++        for (shadow, from, to) in self.pieces.drain(..) {
++            if let Some((s, _, end)) = &mut run
+                 && s.root_key() == shadow.root_key()
+                 && from <= *end + 4096
+@@ -3394,7 +3467,8 @@
+         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+         // Of a frame, ms preparing submissions and ms waiting for the GPU.
+-        let [cpu, gpu] = [0, 1].map(|i| {
+-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+-        });
++        let [cpu, gpu] = [0, 1].map(|i| {
++            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
++        });
++        let perf = PERF_CORE.each_ref().map(|v| v.swap(0, Ordering::Relaxed) as f64 / frames);
+         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
+             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
+@@ -3412,7 +3486,12 @@
+         let drops = crate::pipeline::take_drops();
+         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+-            self.logged = std::time::Instant::now();
+-            #[cfg(feature = "diagnostics")]
+-            tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
++            self.logged = std::time::Instant::now();
++            tracing::info!(
++                "performance core/frame: submission lock {:.2} ms, main queue calls {:.1} ({:.2} ms CPU), fence blocking {:.1} ({:.2} ms signal/wait incl. fast), completed fences {:.1}, parallel refresh batches {:.1} ranges {:.1}",
++                perf[0] / 1000.0, perf[1], perf[2] / 1000.0, perf[3],
++                perf[4] / 1000.0, perf[5], perf[6], perf[7]
++            );
++            #[cfg(feature = "diagnostics")]
++            tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
+             #[cfg(feature = "diagnostics")]
+             log_gpu_waits();
