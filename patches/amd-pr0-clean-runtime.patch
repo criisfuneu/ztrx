@@ -1,14 +1,16 @@
 diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
 --- a/apps/victory/src/run.rs
 +++ b/apps/victory/src/run.rs
-@@ -70,3 +70,7 @@
--    // The console's fixed drives: the package as `G:`, temporary files `T:`.
+@@ -68,7 +68,11 @@
+         title.storage_bytes >> 20
+     );
+     // The console's fixed drives: the package as `G:`, temporary files `T:`.
 -    victory_hle::modules::files::mount_at('G', title_dir);
--    let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
-+    // The console's fixed drives: the package as `G:`, temporary files `T:`.
 +    // Executable and title DLLs may be in a clean local runtime directory.
 +    // Keep package assets at the user's configured game directory.
 +    let package_dir = cfg.game_dir.as_deref().unwrap_or(title_dir);
 +    anyhow::ensure!(package_dir.is_dir(), "package directory does not exist: {}", package_dir.display());
 +    victory_hle::modules::files::mount_at('G', package_dir);
-+    let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
+     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
+     victory_hle::modules::files::mount_at('T', &temp);
+     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
