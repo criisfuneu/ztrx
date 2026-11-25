@@ -1,0 +1,108 @@
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -2061,50 +2061,61 @@
+         assert_eq!(release(allocator), 0);
+     }
+ 
+-    #[test]
+-    fn lists_are_cut_at_waits_that_follow_work() {
+-        if crate::host::host().is_none() {
+-            return;
+-        }
+-        let null = std::ptr::null();
+-        let (mut allocator, mut list) = (null, null);
+-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+-        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
+-        let memory = [0u64; 2];
+-        let at = |i: usize| (&raw const memory[i]) as u64;
+-        let value = |i: usize| {
+-            // SAFETY: inside the array.
+-            unsafe { (at(i) as *const u64).read_volatile() }
+-        };
+-        for _ in 0..2 {
+-            // SAFETY: inside the array.
+-            unsafe { (at(0) as *mut [u64; 2]).write_volatile([0; 2]) };
+-            state::stencil_ref(list, 3);
+-            // No work yet: not cut.
+-            wait_value(list, at(0), 7, 0);
+-            assert_eq!(submitted(list).len(), 1);
+-            host_list(list).unwrap().count_work();
+-            write64(list, at(0), 1, 0, 0);
+-            wait_value(list, at(1), 7, 4);
+-            assert_eq!(submitted(list).len(), 2);
+-            assert_eq!(close(list), S_OK);
+-            let parts = submitted(list);
+-            assert!(parts[0].unmet().is_empty() && parts[1].unmet().len() == 1);
+-            crate::host::host().unwrap().execute(&[&*parts[0]]);
+-            assert_eq!(value(0), 1);
+-            // Reset while the second part is still to run.
+-            assert_eq!(reset(list, allocator, null), S_OK);
+-            assert_eq!(submitted(list).len(), 1);
+-            // SAFETY: inside the array.
+-            unsafe { (at(1) as *mut u64).write_volatile(4) };
+-            assert!(parts[1].unmet().is_empty());
+-            crate::host::host().unwrap().execute(&[&*parts[1]]);
+-        }
+-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+-        assert_eq!(release(list), 0);
+-        assert_eq!(release(allocator), 0);
+-    }
++    #[test]
++    fn lists_are_cut_at_waits_that_follow_work() {
++        if crate::host::host().is_none() {
++            return;
++        }
++        let null = std::ptr::null();
++        let (mut allocator, mut list) = (null, null);
++        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
++        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
++        // Deferred commands write through raw pointers; the storage must
++        // permit interior mutation rather than mutating a shared reference.
++        let memory = std::cell::UnsafeCell::new([0u64; 2]);
++        let at = |i: usize| {
++            // SAFETY: callers use the two elements of this live array.
++            unsafe { memory.get().cast::<u64>().add(i) as u64 }
++        };
++        let value = |i: usize| {
++            // SAFETY: inside the array.
++            unsafe { (at(i) as *const u64).read_volatile() }
++        };
++        for iteration in 0..2 {
++            // SAFETY: inside the array.
++            unsafe { (at(0) as *mut [u64; 2]).write_volatile([0; 2]) };
++            state::stencil_ref(list, 3);
++            // No work yet: not cut.
++            wait_value(list, at(0), 7, 0);
++            assert_eq!(submitted(list).len(), 1);
++            host_list(list).unwrap().count_work();
++            write64(list, at(0), 1, 0, 0);
++            wait_value(list, at(1), 7, 4);
++            assert_eq!(submitted(list).len(), 2);
++            assert_eq!(close(list), S_OK);
++            let parts = submitted(list);
++            let first = parts[0].unmet();
++            let second = parts[1].unmet();
++            assert!(
++                first.is_empty() && second.len() == 1,
++                "iteration {iteration}: waits {first:?} / {second:?}; values {} / {}; scripts {} / {}",
++                value(0), value(1), parts[0].script(), parts[1].script()
++            );
++            crate::host::host().unwrap().execute(&[&*parts[0]]);
++            assert_eq!(value(0), 1);
++            // Reset while the second part is still to run.
++            assert_eq!(reset(list, allocator, null), S_OK);
++            assert_eq!(submitted(list).len(), 1);
++            // SAFETY: inside the array.
++            unsafe { (at(1) as *mut u64).write_volatile(4) };
++            assert!(parts[1].unmet().is_empty());
++            crate::host::host().unwrap().execute(&[&*parts[1]]);
++        }
++        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
++        assert_eq!(release(list), 0);
++        assert_eq!(release(allocator), 0);
++    }
+ 
+     #[test]
+     fn every_inline_command_falls_back_to_the_table() {
+         let null = std::ptr::null();
