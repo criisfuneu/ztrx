@@ -299,3 +299,80 @@ diff --git a/crates/victory-gpu/src/copystat.rs b/crates/victory-gpu/src/copysta
      let e = map
          .get_or_insert_with(HashMap::new)
          .entry((src, len))
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -136,7 +136,18 @@
+ static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+ 
+ /// Tile snapshots kept at most (512 MiB).
+-const TILE_POOL_MOST: usize = 8192;
++const TILE_POOL_MOST: usize = 8192;
++
++fn tile_pool_limit() -> usize {
++    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *LIMIT.get_or_init(|| {
++        std::env::var("VICTORY_TILE_SNAPSHOT_MB").ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .filter(|&v| v <= 512)
++            .map(|v| v * (1 << 20) / PAGE)
++            .unwrap_or(TILE_POOL_MOST * 3 / 4)
++    })
++}
+ 
+ /// An empty buffer with room for a tile.
+ fn pooled_tile() -> Vec<u8> {
+@@ -150,7 +161,7 @@
+ fn give_back_tiles(all: impl Iterator<Item = Vec<u8>>) {
+     let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+     for v in all {
+-        if pool.len() < TILE_POOL_MOST && v.capacity() >= PAGE {
++        if pool.len() < tile_pool_limit() && v.capacity() == PAGE {
+             pool.push(v);
+         }
+     }
+@@ -172,9 +183,12 @@
+ 
+ /// Bytes of the snapshot memory kept for reuse.
+ pub(crate) fn pool_bytes() -> u64 {
+-    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+-    pool.iter().map(|v| v.capacity() as u64).sum()
+-}
++    let ordinary: u64 = POOL.lock().unwrap_or_else(|e| e.into_inner())
++        .iter().map(|v| v.capacity() as u64).sum();
++    let tiles: u64 = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner())
++        .iter().map(|v| v.capacity() as u64).sum();
++    ordinary + tiles
++}
+ 
+ /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
+ /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
+@@ -178,7 +192,18 @@
+ 
+ /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
+ /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
+-const POOL_BYTES: usize = 512 << 20;
++const POOL_BYTES: usize = 512 << 20;
++
++fn snapshot_pool_limit() -> usize {
++    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *LIMIT.get_or_init(|| {
++        std::env::var("VICTORY_SNAPSHOT_POOL_MB").ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .filter(|&v| v <= 512)
++            .map(|v| v << 20)
++            .unwrap_or(POOL_BYTES * 3 / 4)
++    })
++}
+ 
+ /// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
+ /// and no more than [`POOL_BYTES`] in all).
+@@ -190,7 +215,7 @@
+     let mut total = 0;
+     pool.retain(|v| {
+         total += v.capacity();
+-        total <= POOL_BYTES
++        total <= snapshot_pool_limit()
+     });
+ }
+ 
