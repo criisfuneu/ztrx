@@ -217,3 +217,85 @@ diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
              return Some(written);
          }
      }
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1199,7 +1199,8 @@
+         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+             Vec::new();
+         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+-        for list in runs {
++        let mut seen_writes = std::collections::HashSet::new();
++        for list in runs {
+             for step in &list.deferred().copies {
+                 if let Step::GpuWrite(shadow, address, len) = step {
+                     let target = if shadow.is_card() {
+@@ -1207,9 +1208,7 @@
+                     } else {
+                         &mut cpu_back
+                     };
+-                    if !target.iter().any(|(s, a, l)| {
+-                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
+-                    }) {
++                    if seen_writes.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len)) {
+                         target.push((shadow.clone(), *address, *len));
+                     }
+                 }
+@@ -1221,9 +1220,7 @@
+             } else {
+                 &mut cpu_back
+             };
+-            if !target.iter().any(|(s, a, l)| {
+-                std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
+-            }) {
++            if seen_writes.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
+                 target.push((shadow, address, len));
+             }
+         }
+@@ -1429,16 +1426,15 @@
+             // across CPU cores without lock contention on `before`/`pending`.
+             let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
+                 Vec::new();
+-            for item in back {
+-                if let Some(g) = groups
+-                    .iter_mut()
+-                    .find(|g| std::sync::Arc::ptr_eq(&g[0].0, &item.0))
+-                {
+-                    g.push(item);
+-                } else {
+-                    groups.push(vec![item]);
+-                }
+-            }
++            let mut group_by_shadow = std::collections::HashMap::<usize, usize>::new();
++            for item in back {
++                let key = std::sync::Arc::as_ptr(&item.0) as usize;
++                let index = *group_by_shadow.entry(key).or_insert_with(|| {
++                    groups.push(Vec::new());
++                    groups.len() - 1
++                });
++                groups[index].push(item);
++            }
+             if groups.len() <= 1 {
+                 for (shadow, address, len) in &groups[0] {
+                     let written = shadow.copy_back(*address, *len);
+diff --git a/crates/victory-gpu/src/copystat.rs b/crates/victory-gpu/src/copystat.rs
+--- a/crates/victory-gpu/src/copystat.rs
++++ b/crates/victory-gpu/src/copystat.rs
+@@ -60,8 +60,15 @@
+ static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
+ 
+ /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
+-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+-    let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
++pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
++    // Keep aggregate counters; detailed range tracing is opt-in.
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ENABLED.get_or_init(|| {
++        std::env::var_os("VICTORY_COPY_RANGES").is_some_and(|v| v == "1")
++    }) {
++        return;
++    }
++    let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+     let e = map
+         .get_or_insert_with(HashMap::new)
+         .entry((src, len))
