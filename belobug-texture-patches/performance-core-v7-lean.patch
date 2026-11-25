@@ -1,0 +1,94 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1239,5 +1239,6 @@
+                         &mut cpu_back
+                     };
+-                    if seen_writes.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len)) {
++                    let key = if crate::shadow::v7_indexed_pending() { shadow.root_key() } else { std::sync::Arc::as_ptr(shadow) as usize };
++                    if seen_writes.insert((key, *address, *len)) {
+                         target.push((shadow.clone(), *address, *len));
+                     }
+@@ -1251,5 +1252,6 @@
+                 &mut cpu_back
+             };
+-            if seen_writes.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
++            let key = if crate::shadow::v7_indexed_pending() { shadow.root_key() } else { std::sync::Arc::as_ptr(&shadow) as usize };
++            if seen_writes.insert((key, address, len)) {
+                 target.push((shadow, address, len));
+             }
+@@ -1490,5 +1492,5 @@
+             let mut group_by_shadow = std::collections::HashMap::<usize, usize>::new();
+             for item in back {
+-                let key = std::sync::Arc::as_ptr(&item.0) as usize;
++                let key = if crate::shadow::v7_indexed_pending() { item.0.root_key() } else { std::sync::Arc::as_ptr(&item.0) as usize };
+                 let index = *group_by_shadow.entry(key).or_insert_with(|| {
+                     groups.push(Vec::new());
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1454,8 +1454,18 @@
+ 
+ #[derive(Default)]
+-struct SparseBefore {
+-    tiles: std::collections::HashMap<u32, SparseSnapshot, Mix>,
+-    covered: std::collections::HashSet<(usize, usize)>,
+-}
++struct SparseBefore {
++    tiles: std::collections::HashMap<u32, SparseSnapshot, Mix>,
++    covered: std::collections::HashSet<(usize, usize)>,
++    // The exact live declarations for this sparse root, distinct from
++    // snapshot coverage. Removed at precisely the old completion boundary.
++    pending_index: std::collections::HashSet<(usize, usize)>,
++}
++
++static V7_PENDING_DUPLICATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++pub(crate) fn v7_indexed_pending() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_INDEXED_PENDING").is_some_and(|v| v == "1"))
++}
+ 
+ static SPARSE_PERF: [std::sync::atomic::AtomicU64; 3] =
+@@ -1473,5 +1483,6 @@
+     let [batches, pages, checked_bytes, changed_bytes, compare_us] =
+         READBACK_COMPARE.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
+-    tracing::info!(batches, pages, checked_bytes, changed_bytes, compare_us, "parallel sparse readback interval");
++    tracing::info!(batches, pages, checked_bytes, changed_bytes, compare_us, "parallel sparse readback interval");
++    tracing::info!(duplicates = V7_PENDING_DUPLICATES.swap(0, Ordering::Relaxed), "V7 indexed pending interval");
+ }
+ 
+@@ -2011,10 +2022,12 @@
+ 
+     /// [`Shadow::writing`] of a sparse copy.
+-    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
+-        self.pending
+-            .lock()
+-            .unwrap_or_else(|e| e.into_inner())
+-            .push((address, address + len));
+-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
++    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
++        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
++        let range = (address, address + len);
++        if !v7_indexed_pending() || before.pending_index.insert(range) {
++            self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(range);
++        } else {
++            V7_PENDING_DUPLICATES.fetch_add(1, Ordering::Relaxed);
++        }
+         let start = self.start as usize;
+         #[cfg(feature = "diagnostics")]
+@@ -2153,8 +2166,10 @@
+         }
+         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+-        pending.retain(|&r| r != (address, address + len));
+-        SPARSE_PERF[2].fetch_add(skipped, Ordering::Relaxed);
+-        if pending.is_empty() {
+-            before.covered.clear();
++        pending.retain(|&r| r != (address, address + len));
++        before.pending_index.remove(&(address, address + len));
++        SPARSE_PERF[2].fetch_add(skipped, Ordering::Relaxed);
++        if pending.is_empty() {
++            before.pending_index.clear();
++            before.covered.clear();
+             give_back_tiles(before.tiles.drain().map(|(_, snapshot)| snapshot.bytes));
+         }
