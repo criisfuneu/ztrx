@@ -126,3 +126,94 @@ diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/
              let plan = Arc::new(BindlessPlan {
                  reads: plan.reads.clone(),
                  writes: plan.writes.clone(),
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -154,10 +154,13 @@
+     }
+     j.asked += 1;
+     let now = j.asked;
+-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+-    for page in pages.collect::<Vec<_>>() {
+-        j.written.insert(page, now);
+-    }
++    // Fold the kernel answer directly into the journal.
++    for &at in &j.found[..count] {
++        j.written.insert(at / PAGE, now);
++    }
++    for page in guarded {
++        j.written.insert(page, now);
++    }
+     Some((
+         now,
+         j.written
+@@ -360,23 +363,52 @@
+     {
+         let mut g = guards();
+         if g.protected.contains(&first) || g.holes.contains(&first) {
+-            let mut written = Vec::new();
+-            let mut run: Option<usize> = None;
+-            for block in first..=last {
+-                let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
+-                if open {
+-                    if g.protected.contains(&block) {
+-                        g.clean.insert(block);
+-                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+-                    } else {
+-                        run.get_or_insert(block);
+-                        continue;
+-                    }
+-                }
+-                if let Some(from) = run.take() {
+-                    protect(&mut g, from, block, &mut written);
+-                }
+-            }
++            // Walk ordered clean/hole sets once instead of two tree searches
++            // per block. Collect only gaps while holding the same guard lock.
++            let mut gaps = Vec::new();
++            {
++                let mut clean = g.clean.range(first..last).copied().peekable();
++                let mut holes = g.holes.range(first..last).copied().peekable();
++                let mut at = first;
++                loop {
++                    let next = match (clean.peek(), holes.peek()) {
++                        (Some(&a), Some(&b)) => a.min(b),
++                        (Some(&a), None) | (None, Some(&a)) => a,
++                        (None, None) => break,
++                    };
++                    if at < next {
++                        gaps.push((at, next));
++                    }
++                    if clean.peek() == Some(&next) {
++                        let _ = clean.next();
++                    }
++                    if holes.peek() == Some(&next) {
++                        let _ = holes.next();
++                    }
++                    at = next + 1;
++                }
++                if at < last {
++                    gaps.push((at, last));
++                }
++            }
++            let mut written = Vec::new();
++            for (a, b) in gaps {
++                let mut run: Option<usize> = None;
++                for block in a..b {
++                    if g.protected.contains(&block) {
++                        g.clean.insert(block);
++                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
++                        if let Some(from) = run.take() {
++                            protect(&mut g, from, block, &mut written);
++                        }
++                    } else {
++                        run.get_or_insert(block);
++                    }
++                }
++                if let Some(from) = run {
++                    protect(&mut g, from, b, &mut written);
++                }
++            }
+             return Some(written);
+         }
+     }
