@@ -113,6 +113,7 @@ internal sealed class Launcher : Form {
             Directory.CreateDirectory(Path.Combine(root,"logs"));
             Directory.CreateDirectory(Path.Combine(root,"cache"));
             Directory.CreateDirectory(Path.Combine(root,"data"));
+            string runtimeTitle = await Task.Run(() => PrepareRuntime(title));
             string hash;
             using(SHA256 sha=SHA256.Create()) using(FileStream file=File.OpenRead(exe)) hash=BitConverter.ToString(sha.ComputeHash(file)).Replace("-","").Substring(0,16);
             string marker=Path.Combine(root,"cache","warm-"+hash+".ready");
@@ -125,7 +126,7 @@ internal sealed class Launcher : Form {
             }
             if(cancelled) { Status("Teste encerrado."); return; }
             Status("Abrindo o jogo. Mantenha esta janela aberta durante o teste.");
-            int code=await Task.Run(() => Run(exe,"run \""+title+"\" --execute --console "+console,title,"jogo"));
+            int code=await Task.Run(() => Run(exe,"run \""+runtimeTitle+"\" --execute --console "+console,title,"jogo"));
             Status("Jogo encerrou com codigo 0x"+unchecked((uint)code).ToString("X8")+". Consulte o log abaixo.");
         } catch(Exception failure) {
             lines.Enqueue(failure.ToString());
@@ -135,6 +136,31 @@ internal sealed class Launcher : Form {
             child=null; busy=false;
             if(!IsDisposed) { start.Enabled=true; browse.Enabled=true; game.Enabled=true; mode.Enabled=true; stop.Enabled=false; }
         }
+    }
+
+    string PrepareRuntime(string title) {
+        string source=Path.GetDirectoryName(title);
+        string destination=Path.Combine(root,"title-runtime");
+        Directory.CreateDirectory(destination);
+        CopyRuntimeFile(title,Path.Combine(destination,Path.GetFileName(title)));
+        foreach(string path in Directory.GetFiles(source,"*.dll")) {
+            string name=Path.GetFileName(path);
+            if(name.EndsWith("_original.dll",StringComparison.OrdinalIgnoreCase)) continue;
+            string original=Path.Combine(source,Path.GetFileNameWithoutExtension(name)+"_original.dll");
+            CopyRuntimeFile(File.Exists(original)?original:path,Path.Combine(destination,name));
+        }
+        foreach(string name in new string[] { "MicrosoftGame.config", "appxmanifest.xml" }) {
+            string path=Path.Combine(source,name);
+            if(File.Exists(path)) CopyRuntimeFile(path,Path.Combine(destination,name));
+        }
+        return Path.Combine(destination,Path.GetFileName(title));
+    }
+
+    static void CopyRuntimeFile(string source,string destination) {
+        FileInfo from=new FileInfo(source), to=new FileInfo(destination);
+        if(to.Exists && from.Length==to.Length && from.LastWriteTimeUtc==to.LastWriteTimeUtc) return;
+        File.Copy(source,destination,true);
+        File.SetLastWriteTimeUtc(destination,from.LastWriteTimeUtc);
     }
 
     int Run(string exe,string arguments,string title,string stage) {

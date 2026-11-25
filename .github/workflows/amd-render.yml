@@ -56,11 +56,16 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item runtime/target/diag/victory.exe dist/
           Copy-Item runtime/README.md,runtime/LICENSE dist/
+          Copy-Item launcher/Launcher.cs dist/
+          $csc = Join-Path $env:SystemRoot 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+          & $csc /nologo /target:winexe /platform:x64 /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:dist/Iniciar-AMD.exe launcher/Launcher.cs
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher build failed' }
           Copy-Item patches dist/patches -Recurse
           $manifest = [ordered]@{
             upstream_repository = 'JoshuuDev/victory-amd'
             upstream_commit = '003beef2b915341eba88974de021e3118250cb6c'
             patches = @(2,3,4)
+            local_fixes = @('separate-title-runtime-and-asset-roots')
             control_commit = $env:GITHUB_SHA
             run_id = $env:GITHUB_RUN_ID
             binary_sha256 = (Get-FileHash dist/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -97,10 +102,13 @@ jobs:
           } | ConvertTo-Json -Depth 4 | Set-Content build-output/manifest.json -Encoding utf8
           git config user.name 'criisfuneu'
           git config user.email '347959980+criisfuneu@users.noreply.github.com'
-          git switch --orphan $deliveryBranch
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot create delivery branch' }
-          git add build-output
-          git commit -m "Verified AMD build delivery for run $env:GITHUB_RUN_ID"
+          $env:GIT_INDEX_FILE = Join-Path $env:RUNNER_TEMP 'amd-delivery.index'
+          git read-tree --empty
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create delivery index' }
+          git -c core.autocrlf=false add -- build-output
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot stage delivery' }
+          $deliveryTree = git write-tree
+          $deliveryCommit = git commit-tree $deliveryTree -m "Verified AMD build delivery for run $env:GITHUB_RUN_ID"
           if ($LASTEXITCODE -ne 0) { throw 'Cannot commit delivery' }
-          git push origin "HEAD:refs/heads/$deliveryBranch"
+          git push origin "$($deliveryCommit):refs/heads/$deliveryBranch"
           if ($LASTEXITCODE -ne 0) { throw 'Cannot publish delivery' }
