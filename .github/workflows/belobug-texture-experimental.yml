@@ -1,7 +1,7 @@
-name: AMD Performance Core V5
+name: AMD Pipeline Overhaul V6 SAFE and TURBO
 on:
   push:
-    branches: [amd-performance-core-v5]
+    branches: [amd-performance-core-v6]
     paths:
       - '.github/workflows/belobug-texture-experimental.yml'
       - 'belobug-texture-patches/**'
@@ -62,9 +62,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply ../belobug-texture-patches/performance-core-v5.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply --check ../belobug-texture-patches/performance-core-v6.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply ../belobug-texture-patches/performance-core-v6.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:CARGO_PROFILE_DIAG_LTO = 'thin'
           $env:CARGO_PROFILE_DIAG_CODEGEN_UNITS = '1'
-          cargo build --locked --profile diag -p victory --features diagnostics
+          # V6 adds pinned Rayon; resolve the new dependency in CI and retain the lockfile.
+          cargo build --profile diag -p victory --features diagnostics
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./target/diag/victory.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -73,12 +78,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item runtime/target/diag/victory.exe,runtime/README.md,runtime/LICENSE dist/
-          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch,belobug-texture-patches/performance-core.patch,belobug-texture-patches/performance-core-v2.patch,belobug-texture-patches/performance-core-v3.patch,belobug-texture-patches/performance-core-v4.patch,belobug-texture-patches/performance-core-v5.patch dist/
+          Copy-Item runtime/target/diag/victory.exe,runtime/README.md,runtime/LICENSE,runtime/Cargo.lock dist/
+          Copy-Item belobug-texture-patches/staging-history.patch,belobug-texture-patches/gpu-safe.patch,belobug-texture-patches/bindless-card-telemetry.patch,belobug-texture-patches/performance-core.patch,belobug-texture-patches/performance-core-v2.patch,belobug-texture-patches/performance-core-v3.patch,belobug-texture-patches/performance-core-v4.patch,belobug-texture-patches/performance-core-v5.patch,belobug-texture-patches/performance-core-v6.patch dist/
           $manifest = [ordered]@{
             upstream_repository = 'Belobug/VIctory-Belobug-AMD'
             upstream_commit = '71652a2c15a0da68cd801890e1f71109670f9ca5'
-            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch','performance-core.patch','performance-core-v2.patch','performance-core-v3.patch','performance-core-v4.patch','performance-core-v5.patch')
+            local_runtime_patches = @('staging-history.patch','gpu-safe.patch','bindless-card-telemetry.patch','performance-core.patch','performance-core-v2.patch','performance-core-v3.patch','performance-core-v4.patch','performance-core-v5.patch','performance-core-v6.patch')
             codegen = 'Thin LTO, one codegen unit for diag build'
             validation = 'Build and CLI smoke test only at packaging; hardware validation pending. Workspace tests reported separately in this run.'
             control_commit = $env:GITHUB_SHA
@@ -113,7 +118,9 @@ jobs:
           Completed fences skip the event wait; main queue calls, lock and fence time are reported.
           Optional batch GPU timestamps: VICTORY_GPU_TIMING_BATCH=1 plus VICTORY_D3D12_DRED=1.
           Timestamp mode reports command durations, not hardware utilization; it adds instrumentation.
-          Async submission is disabled in the preset following a device-hung regression.
+          V6: six persistent Rayon workers, existing scoped fallback, unchanged bindless-plan fast path and restricted async admission.
+          SAFE stays synchronous. TURBO admits only narrowly checked lists; all other work is synchronous. A GPU reset is still possible; restart using SAFE.
+          GPU timing is optional and disables async for measured submissions. No new sparse VRAM migration or shader-side write tracking in this build.
           Use gpu-balance.ps1 to enable the experimental environment preset.
           See README.md and source-info.json.
           '@ | Set-Content dist/EXPERIMENTAL.txt -Encoding utf8
@@ -132,13 +139,51 @@ jobs:
           $env:VICTORY_PERF_BOUNDED_REPROBE = '1'
           $env:VICTORY_PERF_PENDING_COMPACT = '1'
           $env:VICTORY_PERF_TILE_BATCH = '1'
+          $env:VICTORY_PERF_PERSISTENT_WORKERS = '1'
+          $env:VICTORY_PERF_FAST_PLAN = '1'
           $env:VICTORY_SWEEP_TILES = '0'
           $env:VICTORY_RAYS = '0'
           $env:RUST_LOG = 'info,victory_gpu::pipeline=warn,victory_gpu::pipeline::library=info'
           '@ | Set-Content dist/gpu-balance.ps1 -Encoding utf8
+          @'
+          param(
+              [Parameter(Mandatory=$true)][string]$GameExe,
+              [switch]$GpuTiming
+          )
+          . "$PSScriptRoot\gpu-balance.ps1"
+          $env:VICTORY_PRESENT_TARGET = '1x1:1'
+          $env:VICTORY_HAIR = '1'
+          $env:VICTORY_TEXTURE_HISTORY = '0'
+          $env:VICTORY_ASYNC_SUBMIT = '0'
+          Remove-Item Env:VICTORY_GPU_TIMING,Env:VICTORY_GPU_TIMING_BATCH,Env:VICTORY_D3D12_DRED -ErrorAction SilentlyContinue
+          if ($GpuTiming) {
+              $env:VICTORY_GPU_TIMING_BATCH = '1'
+              $env:VICTORY_D3D12_DRED = '1'
+              $env:VICTORY_ASYNC_SUBMIT = '0'
+          }
+          & "$PSScriptRoot\victory.exe" run $GameExe --execute --console series-x 2>&1 | Tee-Object -FilePath "$PSScriptRoot\victory-v6-safe.log"
+          '@ | Set-Content dist/Iniciar-SAFE.ps1 -Encoding utf8
+          @'
+          param(
+              [Parameter(Mandatory=$true)][string]$GameExe,
+              [switch]$GpuTiming
+          )
+          . "$PSScriptRoot\gpu-balance.ps1"
+          $env:VICTORY_PRESENT_TARGET = '1x1:1'
+          $env:VICTORY_HAIR = '1'
+          $env:VICTORY_TEXTURE_HISTORY = '0'
+          $env:VICTORY_ASYNC_SUBMIT = '1'
+          Remove-Item Env:VICTORY_GPU_TIMING,Env:VICTORY_GPU_TIMING_BATCH,Env:VICTORY_D3D12_DRED -ErrorAction SilentlyContinue
+          if ($GpuTiming) {
+              $env:VICTORY_GPU_TIMING_BATCH = '1'
+              $env:VICTORY_D3D12_DRED = '1'
+              $env:VICTORY_ASYNC_SUBMIT = '0'
+          }
+          & "$PSScriptRoot\victory.exe" run $GameExe --execute --console series-x 2>&1 | Tee-Object -FilePath "$PSScriptRoot\victory-v6-turbo.log"
+          '@ | Set-Content dist/Iniciar-TURBO.ps1 -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: amd-performance-core-v5-DIAG-EXPERIMENTAL
+          name: amd-pipeline-overhaul-v6-SAFE-TURBO-DIAG
           path: dist/
           if-no-files-found: error
       - name: Run workspace tests (results may fail on hosted GPU)
