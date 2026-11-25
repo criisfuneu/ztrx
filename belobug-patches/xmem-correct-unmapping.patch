@@ -1,0 +1,259 @@
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -388,6 +388,10 @@
+     reservations: Vec<(usize, usize)>,
+     /// Of them, those shown whole by one view: start, length, the section.
+     whole: Vec<(usize, usize, Arc<Section>)>,
++    /// Placeholder boundaries hidden while a reservation is shown whole.
++    whole_cuts: HashMap<usize, Vec<usize>>,
++    /// Reservations that needed ordinary page mapping after an unmap.
++    no_whole: std::collections::HashSet<usize>,
+     /// Pages with a place in such a view.
+     bound: std::collections::HashSet<usize>,
+ }
+@@ -694,16 +698,13 @@
+     let Some(first) = physical.pages.get(&pages[0]).cloned() else {
+         return false;
+     };
+-    if pages.len() > 64 && physical.whole.is_empty() {
+-        tracing::debug!(base = format_args!("{base:#x}"), n = pages.len(), reservations = ?physical.reservations.iter().map(|r| format!("{:x}+{:x}", r.0, r.1)).collect::<Vec<_>>(), "whole: asked");
+-    }
+     let known = physical
+         .whole
+         .iter()
+         .find(|(at, len, _)| *at <= base && end <= at + len)
+         .cloned();
+-    let (at, _, section) = match known {
+-        Some(w) => w,
++    let (at, len, section, new) = match known {
++        Some((at, len, section)) => (at, len, section, false),
+         None => {
+             let Some(&(at, len)) = physical
+                 .reservations
+@@ -712,56 +713,91 @@
+             else {
+                 return false;
+             };
+-            if len <= WHOLE {
+-                tracing::debug!(at = format_args!("{at:#x}"), len, section = first.section.1, views = ?physical.views.range(..at + len).next_back().map(|(v, (n, _))| (*v, *n)), "whole?");
+-            }
+             if len > WHOLE
+                 || len != first.section.1
++                || physical.no_whole.contains(&at)
+                 || physical.views.range(..at + len).next_back().is_some_and(|(v, (n, _))| v + n > at)
+                 || physical.whole.iter().any(|w| Arc::ptr_eq(&w.2, &first.section))
+             {
+                 return false;
+             }
+-            let all = Slice {
+-                section: first.section.clone(),
+-                index: 0,
+-            };
+-            // The title splits it in pieces before it maps them.
+-            const COALESCE: u32 = 1;
+-            // SAFETY: placeholders of one reservation, none mapped.
+-            unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE | COALESCE) };
+-            if !map_view(at, len, &all) {
+-                return false;
+-            }
+-            tracing::info!(at = format_args!("{at:#x}"), len, "a reservation of physical pages shown whole");
+-            victory_gpu::title_memory_remapped(at, len);
+-            physical.views.insert(at, (len, all));
+-            physical.whole.push((at, len, first.section.clone()));
+-            (at, len, first.section.clone())
++            (at, len, first.section.clone(), true)
+         }
+     };
++
++    // Reusing a bound page at a different offset, or mapping another
++    // allocation into this reservation, needs real aliases. Validate the
++    // entire request before creating a whole view or moving page indices.
+     let mut owners: HashMap<usize, usize> = physical
+         .pages
+         .iter()
+         .filter(|(_, s)| Arc::ptr_eq(&s.section, &section))
+         .map(|(&p, s)| (s.index, p))
+         .collect();
++    let mut seen = std::collections::HashSet::new();
+     for (k, page) in pages.iter().enumerate() {
+         let wanted = (base - at) / PAGE + k;
+-        let Some(slice) = physical.pages.get(page).cloned() else {
++        let Some(slice) = physical.pages.get(page) else {
+             return false;
+         };
+-        let same = Arc::ptr_eq(&slice.section, &section);
+-        let owner = owners.get(&wanted).copied();
+-        let taken = owner.is_some_and(|o| o != *page && physical.bound.contains(&o));
+-        if !same || slice.index != wanted && (taken || physical.bound.contains(page)) {
+-            // shortcut: shown as it is; the title sees other bytes than it
+-            // asked for.
+-            tracing::warn!(page, wanted, same, "a page mapped again in a reservation shown whole");
+-            continue;
+-        }
++        let taken = owners
++            .get(&wanted)
++            .is_some_and(|o| *o != *page && physical.bound.contains(o));
++        if !seen.insert(*page)
++            || !Arc::ptr_eq(&slice.section, &section)
++            || slice.index != wanted && (taken || physical.bound.contains(page))
++        {
++            return false;
++        }
++    }
++
++    if new {
++        // Remember the title's own pieces before temporarily joining them.
++        // They must reappear if the title later unmaps or replaces pages.
++        let mut cuts = Vec::new();
++        let mut cursor = at;
++        while cursor < at + len {
++            let Some((start, stop)) = placeholder(cursor) else {
++                return false;
++            };
++            if start != cursor || stop <= cursor || stop > at + len {
++                return false;
++            }
++            if stop < at + len {
++                cuts.push(stop);
++            }
++            cursor = stop;
++        }
++        if !cuts.is_empty() {
++            const COALESCE: u32 = 1;
++            // SAFETY: the checked pieces of this one unmapped reservation.
++            if unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE | COALESCE) } == 0 {
++                return false;
++            }
++        }
++        let all = Slice {
++            section: section.clone(),
++            index: 0,
++        };
++        if !map_view(at, len, &all) {
++            for &cut in &cuts {
++                split_at(cut);
++            }
++            return false;
++        }
++        tracing::info!(at = format_args!("{at:#x}"), len, "a reservation of physical pages shown whole");
++        victory_gpu::title_memory_remapped(at, len);
++        physical.views.insert(at, (len, all));
++        physical.whole_cuts.insert(at, cuts);
++        physical.whole.push((at, len, section.clone()));
++    }
++
++    for (k, page) in pages.iter().enumerate() {
++        let wanted = (base - at) / PAGE + k;
++        // Validated above; the physical table stays locked throughout.
++        let slice = physical.pages.get(page).unwrap().clone();
+         if slice.index != wanted {
+-            if let Some(owner) = owner {
++            if let Some(owner) = owners.get(&wanted).copied() {
+                 owners.insert(slice.index, owner);
+                 if let Some(s) = physical.pages.get_mut(&owner) {
+                     s.index = slice.index;
+@@ -775,14 +811,6 @@
+         physical.bound.insert(*page);
+     }
+     true
+-}
+-
+-/// Whether `[base, base + len)` lies in a reservation shown whole.
+-fn in_whole(physical: &Physical, base: usize, len: usize) -> bool {
+-    physical
+-        .whole
+-        .iter()
+-        .any(|(at, n, _)| *at <= base && base + len <= at + n)
+ }
+ 
+ /// One page at each address; null `pages`, or a page number 0, unmaps
+@@ -821,11 +849,10 @@
+ /// heap. Page by page; false if a source page is not mapped physical memory.
+ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+     let (to, from, len) = (to as usize, from as usize, len as usize);
++    if len == 0 {
++        return true;
++    }
+     let mut physical = physical();
+-    if in_whole(&physical, to, len) {
+-        tracing::warn!(to = format_args!("{to:#x}"), len, "page mappings into a reservation shown whole");
+-        return false;
+-    }
+     unmap(&mut physical, to, len);
+     for k in (0..len).step_by(PAGE) {
+         if from == 0 {
+@@ -1035,7 +1062,7 @@
+     // No bytes: no view to return. The search below would still find the
+     // view holding `base` and cut it in two there, and its range of views
+     // starting inside would run backwards (which `BTreeMap` panics on).
+-    if len == 0 || in_whole(physical, base, len) {
++    if len == 0 {
+         return;
+     }
+     let end = base + len;
+@@ -1055,6 +1082,22 @@
+         let Some((size, slice)) = physical.views.remove(&at) else {
+             continue;
+         };
++        let cuts = physical.whole_cuts.remove(&at).unwrap_or_default();
++        if physical.whole.iter().any(|(start, _, _)| *start == at) {
++            physical.whole.retain(|(start, _, _)| *start != at);
++            // Once a reservation needs holes or aliases, keep ordinary
++            // page semantics on subsequent mappings of that reservation.
++            physical.no_whole.insert(at);
++            let pages: Vec<usize> = physical
++                .pages
++                .iter()
++                .filter(|(_, page)| Arc::ptr_eq(&page.section, &slice.section))
++                .map(|(&number, _)| number)
++                .collect();
++            for page in pages {
++                physical.bound.remove(&page);
++            }
++        }
+         victory_gpu::title_memory_remapped(at, size);
+         victory_gpu::title_memory_view_gone(at, size);
+         // SAFETY: a view we mapped; it becomes a placeholder again.
+@@ -1067,6 +1110,9 @@
+                 MEM_PRESERVE_PLACEHOLDER,
+             )
+         };
++        for cut in cuts {
++            split_at(cut);
++        }
+         if at < base {
+             map(physical, at, base - at, slice.clone());
+         }
+@@ -1583,6 +1629,32 @@
+         // SAFETY: the title's own piece, unmapped.
+         assert_ne!(unsafe { VirtualFree(at(2), 0, MEM_RELEASE) }, 0);
+         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
++    }
++
++    /// A whole reservation remains the fast path until a real alias is
++    /// requested. Replacing a bound page must show its actual bytes.
++    #[test]
++    fn a_whole_reservation_falls_back_for_a_repeated_page() {
++        let (pages, a) = pages_and_reservation(3);
++        let second = a.wrapping_byte_add(PAGE);
++        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
++        assert!(physical().whole.iter().any(|(at, _, _)| *at == a as usize));
++        // SAFETY: the reservation is mapped read-write.
++        unsafe {
++            a.cast::<u8>().write(19);
++            second.cast::<u8>().write(37);
++        }
++        assert_eq!(XMemMapPhysicalPages(second, 1, pages.as_ptr()), second);
++        // SAFETY: both addresses now alias physical page 0.
++        unsafe {
++            assert_eq!(second.cast::<u8>().read(), 19);
++            second.cast::<u8>().write(42);
++            assert_eq!(a.cast::<u8>().read(), 42);
++        }
++        assert!(!physical().whole.iter().any(|(at, _, _)| *at == a as usize));
++        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
++        assert_eq!(query(a).host.State, MEM_RESERVE);
++        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+     }
+ 
+     /// A run whose second part is no placeholder (memory committed in place
