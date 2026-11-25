@@ -1,0 +1,17 @@
+diff --git a/crates/victory-shader/src/emit/lane_read_loop_tests.rs b/crates/victory-shader/src/emit/lane_read_loop_tests.rs
+--- a/crates/victory-shader/src/emit/lane_read_loop_tests.rs
++++ b/crates/victory-shader/src/emit/lane_read_loop_tests.rs
+@@ -113,6 +113,13 @@
+             }
+         }
+     }
++    // Hosted Windows CI may not have a physical D3D12 adapter.
++    // Exercise the same assertions on WARP, rather than skipping them.
++    if out.is_empty() && std::env::var_os("GITHUB_ACTIONS").is_some() {
++        let host = Host::new(true).expect("CI requires a D3D12 WARP device with SM 6.6");
++        eprintln!("No hardware D3D12 adapter; testing on WARP");
++        out.push(("WARP (CI)".into(), host));
++    }
+     out
+ }
+ 

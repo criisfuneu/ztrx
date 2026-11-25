@@ -39,7 +39,7 @@
 -            }
              if len > WHOLE
                  || len != first.section.1
-+                || physical.no_whole.contains(&at)
++                || base != at || end != at + len || physical.no_whole.contains(&at)
                  || physical.views.range(..at + len).next_back().is_some_and(|(v, (n, _))| v + n > at)
                  || physical.whole.iter().any(|w| Arc::ptr_eq(&w.2, &first.section))
              {
