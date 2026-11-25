@@ -1,0 +1,224 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1423,9 +1423,34 @@
+ }
+ 
+-struct Sparse {
+-    /// By tile: where the CPU writes it, and where it is in which heap.
+-    tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
+-    /// What tiles shaders write held before the submission.
+-    before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
++struct SparseSnapshot {
++    bytes: Vec<u8>,
++    unchanged: bool,
++}
++
++#[derive(Default)]
++struct SparseBefore {
++    tiles: std::collections::HashMap<u32, SparseSnapshot, Mix>,
++    covered: std::collections::HashSet<(usize, usize)>,
++}
++
++static SPARSE_PERF: [std::sync::atomic::AtomicU64; 3] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
++fn sparse_cache_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PERF_SPARSE_CACHE").is_some_and(|v| v == "1"))
++        && sweeps() == 0
++}
++
++pub(crate) fn log_sparse_perf() {
++    let [ranges, lookups, bytes] = SPARSE_PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(ranges, lookups, bytes, "sparse cache performance interval");
++}
++
++struct Sparse {
++    /// By tile: where the CPU writes it, and where it is in which heap.
++    tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
++    /// What tiles shaders write held before the submission.
++    before: Mutex<SparseBefore>,
+     /// By tile: the frame to look at it next in, and how often in a row it
+     /// had not changed.
+@@ -1942,7 +1967,20 @@
+         #[cfg(feature = "diagnostics")]
+         SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
+-        self.each_tile(s, address, address + len, |at, data, _| {
+-            let tile = ((at - start) / PAGE) as u32;
+-            before.entry(tile).or_insert_with(|| {
++        let cache = sparse_cache_enabled();
++        if len == 0 {
++            return;
++        }
++        let end = address + len;
++        let pages = (end - 1) / PAGE - address / PAGE + 1;
++        if cache && before.covered.contains(&(address, end)) {
++            SPARSE_PERF[0].fetch_add(1, Ordering::Relaxed);
++            SPARSE_PERF[1].fetch_add(pages as u64, Ordering::Relaxed);
++            return;
++        }
++        let mut visited = 0usize;
++        self.each_tile(s, address, end, |at, data, _| {
++            visited += 1;
++            let tile = ((at - start) / PAGE) as u32;
++            before.tiles.entry(tile).or_insert_with(|| {
+                 #[cfg(feature = "diagnostics")]
+                 SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
+@@ -1950,11 +1988,15 @@
+                 let mut buf = pooled_tile();
+                 // SAFETY: the tile's mapping.
+-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
+-                buf
+-            });
+-        });
+-    }
+-
+-    /// [`Shadow::copy_back`] of a sparse copy.
++                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
++                SparseSnapshot { bytes: buf, unchanged: false }
++            });
++        });
++        // Only cache fully visited ranges; failed allocations must be retried.
++        if cache && visited == pages && before.covered.len() < 4096 {
++            before.covered.insert((address, end));
++        }
++    }
++
++    /// [`Shadow::copy_back`] of a sparse copy.
+     fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+@@ -1962,18 +2004,27 @@
+         let mut written = 0;
+         let mut title: Option<Vec<u8>> = None;
+-        self.each_tile(s, address, address + len, |at, data, n| {
+-            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
+-                return;
+-            };
+-            let old = &mut old[at % PAGE..at % PAGE + n];
++        let cache = sparse_cache_enabled();
++        let mut skipped = 0u64;
++        self.each_tile(s, address, address + len, |at, data, n| {
++            let Some(snapshot) = before.tiles.get_mut(&(((at - start) / PAGE) as u32)) else {
++                return;
++            };
++            if cache && snapshot.unchanged {
++                skipped += n as u64;
++                return;
++            }
++            let old = &mut snapshot.bytes[at % PAGE..at % PAGE + n];
+             // SAFETY: the tile's mapping; only this thread writes it.
+             let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
+             #[cfg(feature = "diagnostics")]
+             SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+-            if host == old {
+-                return;
+-            }
+-            #[cfg(feature = "diagnostics")]
+-            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
++            if host == old {
++                if cache && at % PAGE == 0 && n == PAGE {
++                    snapshot.unchanged = true;
++                }
++                return;
++            }
++            #[cfg(feature = "diagnostics")]
++            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+             let buf = title.get_or_insert_with(|| {
+                 let mut v = pooled(PAGE);
+@@ -2002,8 +2053,10 @@
+         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+         pending.retain(|&r| r != (address, address + len));
+-        if pending.is_empty() {
+-            give_back_tiles(before.drain().map(|(_, buf)| buf));
+-        }
+-        written
++        SPARSE_PERF[2].fetch_add(skipped, Ordering::Relaxed);
++        if pending.is_empty() {
++            before.covered.clear();
++            give_back_tiles(before.tiles.drain().map(|(_, snapshot)| snapshot.bytes));
++        }
++        written
+     }
+ }
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2705,6 +2705,9 @@
+         // Preserve the vector allocation across the frequent flushes.
+         self.pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
+-        let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
+-        for (shadow, from, to) in self.pieces.drain(..) {
++        let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
++        static SPARSE_PARALLEL: OnceLock<bool> = OnceLock::new();
++        let parallel = *SPARSE_PARALLEL.get_or_init(|| std::env::var_os("VICTORY_PERF_SPARSE_PARALLEL").is_some_and(|v| v == "1"));
++        let mut merged = Vec::new();
++        for (shadow, from, to) in self.pieces.drain(..) {
+             if let Some((s, _, end)) = &mut run
+                 && s.root_key() == shadow.root_key()
+@@ -2714,14 +2717,45 @@
+                 continue;
+             }
+-            if let Some((s, a, b)) = run.replace((shadow, from, to)) {
+-                update(&s, a, b - a);
+-            }
+-        }
+-        if let Some((s, a, b)) = run {
+-            update(&s, a, b - a);
+-        }
+-    }
+-
+-    /// After every list's steps
++            if let Some((s, a, b)) = run.replace((shadow, from, to)) {
++                if parallel { merged.push((s, a, b)); } else { update(&s, a, b - a); }
++            }
++        }
++        if let Some((s, a, b)) = run {
++            if parallel { merged.push((s, a, b)); } else { update(&s, a, b - a); }
++        }
++        if merged.is_empty() { return; }
++        // Groups are ordered by root; aliases of one root are never parallel.
++        // Only parallelize distinct roots with disjoint 64 KiB page ranges.
++        const PAGE: usize = 65536;
++        let mut groups: Vec<&[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]> = Vec::new();
++        let mut rest = merged.as_slice();
++        while let Some(first) = rest.first() {
++            let n = rest.iter().take_while(|x| x.0.root_key() == first.0.root_key()).count();
++            let (group, tail) = rest.split_at(n);
++            groups.push(group);
++            rest = tail;
++        }
++        let disjoint = (2..=8).contains(&groups.len())
++            && merged.len() <= 64
++            && merged.iter().map(|(_, a, b)| b.saturating_sub(*a)).sum::<usize>() >= 4 * 1024 * 1024
++            && groups.iter().enumerate().all(|(i, g)| g.iter().all(|(_, a, b)| {
++                groups[..i].iter().all(|other| other.iter().all(|(_, x, y)| {
++                    b.div_ceil(PAGE) <= *x / PAGE || y.div_ceil(PAGE) <= *a / PAGE
++                }))
++            }));
++        if disjoint {
++            perf_add(6, 1);
++            perf_add(7, merged.len() as u64);
++            in_parallel(&groups, 1, |chunk| {
++                for group in chunk {
++                    for (s, a, b) in *group { update(s, *a, *b - *a); }
++                }
++            });
++        } else {
++            for (s, a, b) in merged { update(&s, a, b - a); }
++        }
++    }
++
++    /// After every list's steps
+     /// indexed heap's slots, once per submission however many lists and
+     /// draws use it. What they read is refreshed (unchanged pages cost only
+@@ -3419,6 +3453,7 @@
+             #[cfg(feature = "diagnostics")]
+             log_gpu_times();
+-            crate::timeline::log_perf();
+-            tracing::info!(
++            crate::timeline::log_perf();
++            crate::shadow::log_sparse_perf();
++            tracing::info!(
+                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
+                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
