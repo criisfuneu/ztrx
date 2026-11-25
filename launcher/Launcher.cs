@@ -148,7 +148,7 @@ internal sealed class Launcher : Form {
             if(!File.Exists(path)) throw new FileNotFoundException("Arquivo de shaders ausente.",path);
             result+=" \""+path+"\"";
         }
-        return result+" --jobs 6";
+        return result+" --jobs 6 --no-pipelines";
     }
 
     string PrepareRuntime(string title) {
