@@ -1,0 +1,136 @@
+diff --git a/crates/victory-shader/src/unspill.rs b/crates/victory-shader/src/unspill.rs
+--- a/crates/victory-shader/src/unspill.rs
++++ b/crates/victory-shader/src/unspill.rs
+@@ -50,8 +50,8 @@
+             }
+         }
+     }
+-    // The input a value copies (`s_mov_b32`), or for a high half also masks
+-    // with a constant (`s_and_b32`).
++    // Follow the original dword through scalar copies, including pair copies.
++    // Only a mask preserving the low eight high-address bits may be ignored.
+     let origin = |mut v: Value, high: bool| -> Option<Reg> {
+         for _ in 0..8 {
+             if let Some(&r) = input_reg.get(&v) {
+@@ -67,12 +67,32 @@
+                 _ => None,
+             };
+             v = match (inst.name(), src.as_slice()) {
+-                ("s_mov_b32", [s]) => scalar(s)?,
+-                ("s_and_b32", [a, b]) if high => match (a, b) {
+-                    (Operand::Scalar { .. }, Operand::Literal(_) | Operand::Const(_)) => scalar(a)?,
+-                    (Operand::Literal(_) | Operand::Const(_), Operand::Scalar { .. }) => scalar(b)?,
+-                    _ => return None,
+-                },
++                ("s_mov_b32", [s]) => scalar(s)?,
++                ("s_mov_b64", [Operand::Scalar { code, .. }]) => {
++                    let k = inst.writes.iter().position(|&(_, written)| written == v)?;
++                    if k >= 2 || *code >= 106 {
++                        return None;
++                    }
++                    let source = code.checked_add(k as u8)?;
++                    if source >= 106 {
++                        return None;
++                    }
++                    inst.read(Reg::S(source))?
++                }
++                ("s_and_b32", [a, b]) if high => {
++                    // The console's address is 40 bits: changing any of the
++                    // low eight bits of the high dword changes the address.
++                    let preserves = |o: &Operand| matches!(
++                        o,
++                        Operand::Literal(0x0000_00ff | 0xffff_ffff)
++                            | Operand::Const(193)
++                    );
++                    match (a, b) {
++                        (Operand::Scalar { .. }, mask) if preserves(mask) => scalar(a)?,
++                        (mask, Operand::Scalar { .. }) if preserves(mask) => scalar(b)?,
++                        _ => return None,
++                    }
++                }
+                 _ => return None,
+             };
+         }
+@@ -331,8 +351,44 @@
+         assert_eq!(p, before);
+     }
+ 
+-    #[test]
+-    fn loads_through_a_root_parameter_are_left_alone() {
++    #[test]
++    fn spill_pointer_copied_as_a_register_pair_keeps_its_origin() {
++        let words = [
++            0xBE82_0400, // s_mov_b64 s[2:3], s[0:1]
++            0xF404_0201,
++            0xFA00_0008, // s_load_dwordx2 s[8:9], s[2:3], 0x8
++            0xF400_0284,
++            0xFA00_0010, // s_load_dword s10, s[8:9], 0x10
++            S_ENDPGM,
++        ];
++        let mut p = program(&words);
++        let layout = spilled_layout();
++        unspill(&mut p, &layout, HwStage::Cs);
++        let r = track(&p, &layout, HwStage::Cs).unwrap();
++        assert_eq!(r.scalar.len(), 1);
++        assert_eq!(r.scalar[0].1.param, 1);
++        assert_eq!(r.scalar[0].1.offset, 0x10);
++    }
++
++    #[test]
++    fn a_mask_that_changes_the_address_is_not_a_spill_pointer() {
++        let mut words = POINTER.to_vec();
++        words[2] = 0x0000_007f;
++        words.extend([
++            0xF404_0201,
++            0xFA00_0008,
++            0xF400_0284,
++            0xFA00_0010,
++            S_ENDPGM,
++        ]);
++        let mut p = program(&words);
++        let before = p.clone();
++        unspill(&mut p, &spilled_layout(), HwStage::Cs);
++        assert_eq!(p, before);
++    }
++
++    #[test]
++    fn loads_through_a_root_parameter_are_left_alone() {
+         // s[16:17] is the first root descriptor: an ordinary load through it.
+         let words = [
+             0xF404_0208,
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -300,10 +300,13 @@
+     // (`XboxBvhBuilder.dll`). Running only a subset of its stages while
+     // `VICTORY_RAYS` is off lets later stages (e.g. `c42a31951201f9a0`) read
+     // uninitialized data from dropped stages and page-fault the GPU.
+-    if rays() {
+-        crate::unspill::unspill(&mut p, &native.layout, native.stage);
+-    }
+-    crate::sgpr_spill::forward(&mut p);
++    if rays() {
++        // Recover scalar values parked in VGPR lanes before tracing the
++        // spill-table pointer, and again after replacing table loads.
++        crate::sgpr_spill::forward(&mut p);
++        crate::unspill::unspill(&mut p, &native.layout, native.stage);
++    }
++    crate::sgpr_spill::forward(&mut p);
+     let traces = resource::traces_rays(&p);
+     let io = io::raise(&p, &native)?;
+     let st = structure::structure(&p)?;
+diff --git a/apps/victory/src/translate.rs b/apps/victory/src/translate.rs
+--- a/apps/victory/src/translate.rs
++++ b/apps/victory/src/translate.rs
+@@ -382,8 +382,9 @@
+                         }
+                     }
+                 }
+-                victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
+-                victory_shader::sgpr_spill::forward(&mut program);
++                victory_shader::sgpr_spill::forward(&mut program);
++                victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
++                victory_shader::sgpr_spill::forward(&mut program);
+                 t.translated += 1;
+                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+                 // As `emit::translate_for`: by address where nothing else does.
