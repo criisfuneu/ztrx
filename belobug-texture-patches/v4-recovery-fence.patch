@@ -1,0 +1,168 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -452,20 +452,10 @@
+     pub(crate) fn execute_and_wait_locked(&self, cmd: ID3D12CommandList, submitted: &mut u64) {
+         *submitted += 1;
+         let fence_val = *submitted;
+-        // SAFETY: caller holds `self.submitted`; `cmd` is closed; fence & event are ours.
+-        unsafe {
+-            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+-            let waited = self
+-                .queue
+-                .Signal(&self.fence, fence_val)
+-                .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
+-            match waited {
+-                Ok(()) => {
+-                    WaitForSingleObject(self.event, INFINITE);
+-                }
+-                Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
+-            }
+-        }
++        // SAFETY: caller holds `self.submitted`; `cmd` is closed.
++        unsafe { self.queue.ExecuteCommandLists(&[Some(cmd)]); }
++        self.signal_checked(fence_val);
++        self.wait_checked_locked(fence_val);
+     }
+ 
+     /// Creates an isolated WARP-backed `Host` for unit tests without touching
+@@ -1096,10 +1086,43 @@
+         }
+     }
+ 
+-    /// Drops completed async submissions and buries objects retired before them.
+-    fn reap_completed(&self) {
+-        // SAFETY: a plain fence query.
+-        let completed = unsafe { self.fence.GetCompletedValue() };
++    // A removed D3D12 device reports UINT64_MAX, not successful completion.
++    fn completed_checked(&self) -> u64 {
++        let completed = unsafe { self.fence.GetCompletedValue() };
++        if completed == u64::MAX {
++            fail(format_args!("D3D12 fence reports device removal"));
++        }
++        completed
++    }
++
++    fn signal_checked(&self, target: u64) {
++        if let Err(e) = unsafe { self.queue.Signal(&self.fence, target) } {
++            fail(format_args!("host fence signal {target} failed: {e}"));
++        }
++    }
++
++    // Caller holds submitted, which serializes access to the shared event.
++    // Return true only when a CPU-side event wait was actually necessary.
++    fn wait_checked_locked(&self, target: u64) -> bool {
++        if self.completed_checked() >= target {
++            return false;
++        }
++        if let Err(e) = unsafe { self.fence.SetEventOnCompletion(target, self.event) } {
++            fail(format_args!("host fence event {target} failed: {e}"));
++        }
++        let result = unsafe { WaitForSingleObject(self.event, INFINITE) };
++        if result != windows::Win32::Foundation::WAIT_OBJECT_0 {
++            fail(format_args!("host fence event {target} wait failed: {:?}", result));
++        }
++        if self.completed_checked() < target {
++            fail(format_args!("host fence event {target} woke before completion"));
++        }
++        true
++    }
++
++    /// Drops completed async submissions and buries objects retired before them.
++    fn reap_completed(&self) {
++        let completed = self.completed_checked();
+         let mut last_sub = 0u64;
+         {
+             let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+@@ -1123,23 +1146,13 @@
+         if target == 0 {
+             return;
+         }
+-        // SAFETY: a plain fence query.
+-        if unsafe { self.fence.GetCompletedValue() } >= target {
+-            self.reap_completed();
+-            return;
+-        }
+-        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+-        // SAFETY: the fence and event are ours; guarded by `submitted`.
+-        unsafe {
+-            if self.fence.GetCompletedValue() < target {
+-                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+-                    tracing::warn!(error = %e, "host fence wait failed");
+-                } else {
+-                    WaitForSingleObject(self.event, INFINITE);
+-                }
+-            }
+-        }
+-        self.reap_completed();
++        if self.completed_checked() >= target {
++            self.reap_completed();
++            return;
++        }
++        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
++        self.wait_checked_locked(target);
++        self.reap_completed();
+     }
+ 
+     /// Waits for all in-flight asynchronous submissions to complete.
+@@ -1168,19 +1181,11 @@
+         if target == 0 {
+             return;
+         }
+-        // SAFETY: the fence and event are ours; caller holds `submitted`.
+-        unsafe {
+-            if self.fence.GetCompletedValue() < target {
+-                let waited = std::time::Instant::now();
+-                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+-                    tracing::warn!(error = %e, "host async drain failed");
+-                } else {
+-                    WaitForSingleObject(self.event, INFINITE);
+-                }
+-                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
+-            }
+-        }
+-        self.reap_completed();
++        let waited = std::time::Instant::now();
++        if self.wait_checked_locked(target) {
++            SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
++        }
++        self.reap_completed();
+     }
+ 
+     /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
+@@ -1344,27 +1349,14 @@
+                 }
+                 continue;
+             }
+-            // SAFETY: the fence and event are ours; submitted serializes access.
+-            unsafe {
+-                let wait_started = std::time::Instant::now();
+-                match self.queue.Signal(&self.fence, fence_val) {
+-                    Ok(()) => {
+-                        let completed = self.fence.GetCompletedValue();
+-                        // UINT64_MAX means device removal, never successful completion.
+-                        if completed != u64::MAX && completed >= fence_val {
+-                            perf_add(5, 1);
+-                        } else {
+-                            perf_add(3, 1);
+-                            match self.fence.SetEventOnCompletion(fence_val, self.event) {
+-                                Ok(()) => { WaitForSingleObject(self.event, INFINITE); }
+-                                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+-                            }
+-                        }
+-                    }
+-                    Err(e) => tracing::warn!(error = %e, "host submission not signalled"),
+-                }
+-                perf_add(4, wait_started.elapsed().as_micros() as u64);
+-            }
++            let wait_started = std::time::Instant::now();
++            self.signal_checked(fence_val);
++            if self.wait_checked_locked(fence_val) {
++                perf_add(3, 1);
++            } else {
++                perf_add(5, 1);
++            }
++            perf_add(4, wait_started.elapsed().as_micros() as u64);
+             #[cfg(feature = "diagnostics")]
+             if each {
+                 // SAFETY: a plain query.
