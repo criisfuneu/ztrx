@@ -71,3 +71,58 @@ diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.
          let Some(seen) = seen.as_ref() else { return };
          let (mut changed, mut back, mut zero) = (0, 0, 0);
          for s in seen.values() {
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -418,7 +418,8 @@
+ fn copy_bounces(list: &[(usize, u64, u32)]) {
+     const GAP: u64 = 4 << 10;
+     const RUN: u64 = 128 << 10;
+-    let mut scratch = vec![0u8; RUN as usize];
++    // Allocate scratch only when a grouped read actually needs it.
++    let mut scratch = Vec::<u8>::new();
+     let mut rest = list;
+     while let Some(&(_, first, len)) = rest.first() {
+         let mut end = first + u64::from(len);
+@@ -434,9 +435,14 @@
+         let (run, after) = rest.split_at(n);
+         rest = after;
+         let whole = (end - first) as usize;
+-        let read = n > 1
+-            && whole <= scratch.len()
+-            && crate::host::read_into(first as *const u8, &mut scratch[..whole]);
++        let read = if n > 1 && whole <= RUN as usize {
++            if scratch.len() < whole {
++                scratch.resize(whole, 0);
++            }
++            crate::host::read_into(first as *const u8, &mut scratch[..whole])
++        } else {
++            false
++        };
+         for &(cpu, a, l) in run {
+             if read {
+                 let from = &scratch[(a - first) as usize..][..l as usize];
+@@ -1696,7 +1702,10 @@
+                     }
+                 }
+             }
+-            let check: Vec<(u32, (u32, u32))> = if viewed {
++            // Urgent slots already have a fresh materialization queued.
++            // Exclude them from the stale-view scan as well as other dirty slots.
++            dirty.extend(urgent.iter().copied());
++            let check: Vec<(u32, (u32, u32))> = if viewed {
+                 b.slots
+                     .iter()
+                     .filter(|(i, _)| !dirty.contains(i))
+@@ -1794,7 +1803,10 @@
+         }
+         // All of it is copied by the first submission of a frame only: the
+         // later ones take what is new.
+-        if !remake && let Some(plan) = &b.plan {
++        // Fresh bounce ranges arrive in descriptor order, not address order.
++        // Match the full plan's ordering so copy_bounces can group nearby reads.
++        fresh.sort_unstable_by_key(|b| b.1);
++        if !remake && let Some(plan) = &b.plan {
+             let plan = Arc::new(BindlessPlan {
+                 reads: plan.reads.clone(),
+                 writes: plan.writes.clone(),
