@@ -58,7 +58,9 @@ jobs:
           Copy-Item runtime/README.md,runtime/LICENSE dist/
           Copy-Item launcher/Launcher.cs dist/
           $csc = Join-Path $env:SystemRoot 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-          & $csc /nologo /target:winexe /platform:x64 /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:dist/Iniciar-AMD.exe launcher/Launcher.cs
+          $launcherSource = (Resolve-Path -LiteralPath '.\launcher\Launcher.cs').Path
+          $launcherOutput = Join-Path (Get-Location) 'dist\Iniciar-AMD.exe'
+          & $csc /nologo /target:winexe /platform:x64 /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll "/out:$launcherOutput" $launcherSource
           if ($LASTEXITCODE -ne 0) { throw 'Launcher build failed' }
           Copy-Item patches dist/patches -Recurse
           $manifest = [ordered]@{
