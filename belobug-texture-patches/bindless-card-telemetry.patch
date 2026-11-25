@@ -1,0 +1,123 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -464,18 +464,17 @@
+     gap: usize,
+ ) -> Vec<(Arc<crate::shadow::Shadow>, usize, usize)> {
+     ranges.sort_unstable_by_key(|(s, a, _)| (Arc::as_ptr(s) as usize, *a));
+-    let mut out: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+-    for (shadow, address, len) in ranges {
+-        if let Some((s, a, l)) = out.last_mut()
+-            && Arc::ptr_eq(s, &shadow)
+-            && address <= *a + *l + gap
+-        {
+-            *l = (*l).max(address + len - *a);
+-            continue;
+-        }
+-        out.push((shadow, address, len));
+-    }
+-    out
++    // Compact the sorted ranges in place rather than allocating a second Vec.
++    // dedup_by receives the later element first and the retained one second.
++    ranges.dedup_by(|(shadow, address, len), (s, a, l)| {
++        if Arc::ptr_eq(s, shadow) && *address <= *a + *l + gap {
++            *l = (*l).max(*address + *len - *a);
++            true
++        } else {
++            false
++        }
++    });
++    ranges
+ }
+ 
+ /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
+diff --git a/crates/victory-gpu/src/card.rs b/crates/victory-gpu/src/card.rs
+--- a/crates/victory-gpu/src/card.rs
++++ b/crates/victory-gpu/src/card.rs
+@@ -114,7 +114,15 @@
+ }
+ 
+ /// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
+-static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
++static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
++
++// Cumulative admission outcomes: disabled, size, engine, budget, cap,
++// allocation failed, accepted. Allocation policy is unchanged.
++static ADMISSION: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
++
++pub(crate) fn admission_counts() -> [u64; 7] {
++    ADMISSION.each_ref().map(|v| v.load(Ordering::Relaxed))
++}
+ 
+ /// Whether VRAM card buffers are enabled (`VICTORY_CARD_BUFFERS=0` disables).
+ pub(crate) fn enabled() -> bool {
+@@ -190,27 +198,34 @@
+     /// Allocates a VRAM card buffer for `size` bytes (must be a multiple of
+     /// `PAGE`) if enabled and within VRAM budget.
+     pub(crate) fn try_new(host: &Host, staging: &ID3D12Resource, size: u64) -> Option<Arc<Self>> {
+-        if !enabled() {
+-            return None;
+-        }
+-        let (min_bytes, max_bytes) = limits();
+-        if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
+-            return None;
+-        }
+-        if !host.card_ready() {
+-            return None;
+-        }
+-        if let Some([(used, budget), _]) = crate::host::video_memory()
+-            && budget > 0
+-            && used.saturating_add(size) > budget * card_budget_percent() / 100
+-        {
+-            return None;
+-        }
+-        if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > max_bytes {
+-            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+-            return None;
+-        }
+-        Self::new_unchecked(host, staging, size, true)
++        if !enabled() {
++            ADMISSION[0].fetch_add(1, Ordering::Relaxed);
++            return None;
++        }
++        let (min_bytes, max_bytes) = limits();
++        if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
++            ADMISSION[1].fetch_add(1, Ordering::Relaxed);
++            return None;
++        }
++        if !host.card_ready() {
++            ADMISSION[2].fetch_add(1, Ordering::Relaxed);
++            return None;
++        }
++        if let Some([(used, budget), _]) = crate::host::video_memory()
++            && budget > 0
++            && used.saturating_add(size) > budget * card_budget_percent() / 100
++        {
++            ADMISSION[3].fetch_add(1, Ordering::Relaxed);
++            return None;
++        }
++        if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > max_bytes {
++            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
++            ADMISSION[4].fetch_add(1, Ordering::Relaxed);
++            return None;
++        }
++        let card = Self::new_unchecked(host, staging, size, true);
++        ADMISSION[if card.is_some() { 6 } else { 5 }].fetch_add(1, Ordering::Relaxed);
++        card
+     }
+ 
+     /// Creates a `CardState` directly (used by `try_new` and WARP unit tests).
+diff --git a/crates/victory-gpu/src/memstat.rs b/crates/victory-gpu/src/memstat.rs
+--- a/crates/victory-gpu/src/memstat.rs
++++ b/crates/victory-gpu/src/memstat.rs
+@@ -133,7 +133,9 @@
+             mib(crate::shadow::pool_bytes()),
+         );
+         let (card, hashes) = crate::card::allocated_bytes();
+-        let _ = write!(line, ", card buffers {} MiB, card hashes {} MiB", mib(card), mib(hashes));
++        let _ = write!(line, ", card buffers {} MiB, card hashes {} MiB", mib(card), mib(hashes));
++        let [off, size, engine, budget, cap, failed, accepted] = crate::card::admission_counts();
++        let _ = write!(line, ", card admissions: accepted {accepted}, disabled {off}, size {size}, engine {engine}, budget {budget}, cap {cap}, allocation failed {failed}");
+         if let Some([local, system]) = crate::host::video_memory() {
+             let _ = write!(
+                 line,
