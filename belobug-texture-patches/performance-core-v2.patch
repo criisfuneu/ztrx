@@ -1,0 +1,184 @@
+diff --git a/crates/victory-gpu/src/timeline.rs b/crates/victory-gpu/src/timeline.rs
+--- a/crates/victory-gpu/src/timeline.rs
++++ b/crates/victory-gpu/src/timeline.rs
+@@ -53,5 +53,8 @@
+     busy: bool,
+     /// Since when the first op is held back.
+-    held: Option<Instant>,
++    held: Option<Instant>,
++    // Capture the kind at the moment the wait starts; the front may be
++    // removed by the time it finishes.
++    held_fence: bool,
+ }
+ 
+@@ -59,5 +62,25 @@
+ static QUEUES: Mutex<Vec<Arc<Timeline>>> = Mutex::new(Vec::new());
+ /// How many queues are held back.
+-static HELD: AtomicU64 = AtomicU64::new(0);
++static HELD: AtomicU64 = AtomicU64::new(0);
++
++// Interval counters: local dispatches, global pumps, queue visits,
++// fence holds and microseconds, memory holds and microseconds, forced waits.
++static PERF: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
++
++fn local_dispatch_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PERF_LOCAL_QUEUE").is_some_and(|v| v == "1"))
++}
++
++/// Called by the frame logger. Held times are summed across queues and
++/// intervals, not GPU time or exclusive wall-clock frame time.
++pub(crate) fn log_perf() {
++    let [local, pumps, visits, fences, fence_us, memory, memory_us, forced] =
++        PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(
++        local, pumps, visits, fences, fence_us, memory, memory_us, forced,
++        "timeline performance interval"
++    );
++}
+ 
+ /// How long queues may be held back while none of them moves. A wait whose
+@@ -89,6 +112,25 @@
+     /// Adds work to the queue and runs what can run, on every queue.
+     pub(crate) fn submit(&self, op: Op) {
+-        self.lock().ops.push_back(op);
+-        pump();
++        self.submit_inner(op, local_dispatch_enabled());
++    }
++
++    fn submit_inner(&self, op: Op, local: bool) {
++        self.lock().ops.push_back(op);
++        // If another queue is already held, preserve the original global
++        // scheduling path. Otherwise run the newly submitted queue directly.
++        // Keep periodic global scans for retirement and catch-up.
++        static SUBMITS: AtomicU64 = AtomicU64::new(0);
++        if !local || held() || SUBMITS.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
++            pump();
++            return;
++        }
++        PERF[0].fetch_add(1, Ordering::Relaxed);
++        if self.step(false) {
++            crate::fence::wake();
++        }
++        // A wait may have appeared while this queue was executing.
++        if held() {
++            pump();
++        }
+     }
+ 
+@@ -168,11 +210,15 @@
+         match (hold, self.held) {
+             (true, None) => {
+-                self.held = Some(Instant::now());
+-                HELD.fetch_add(1, Ordering::AcqRel);
++                self.held = Some(Instant::now());
++                self.held_fence = matches!(self.ops.front(), Some(Op::Wait(..)));
++                HELD.fetch_add(1, Ordering::AcqRel);
+                 watch();
+             }
+             (false, Some(since)) => {
+-                self.held = None;
+-                HELD.fetch_sub(1, Ordering::AcqRel);
++                self.held = None;
++                HELD.fetch_sub(1, Ordering::AcqRel);
++                let index = if self.held_fence { 3 } else { 5 };
++                PERF[index].fetch_add(1, Ordering::Relaxed);
++                PERF[index + 1].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+                 static COUNT: AtomicU64 = AtomicU64::new(0);
+                 let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+@@ -193,6 +239,7 @@
+ /// Runs what can run on every queue, until none moves: what one ran may be
+ /// what another waits for.
+-pub(crate) fn pump() {
+-    loop {
++pub(crate) fn pump() {
++    PERF[1].fetch_add(1, Ordering::Relaxed);
++    loop {
+         // Queues the title released go once they have run everything.
+         let all = {
+@@ -201,6 +248,7 @@
+             queues.clone()
+         };
+-        let mut moved = false;
+-        for queue in &all {
++        PERF[2].fetch_add(all.len() as u64, Ordering::Relaxed);
++        let mut moved = false;
++        for queue in &all {
+             moved |= queue.step(false);
+         }
+@@ -262,5 +310,6 @@
+     };
+     static FORCED: AtomicU64 = AtomicU64::new(0);
+-    let forced = FORCED.fetch_add(1, Ordering::Relaxed) + 1;
++    PERF[7].fetch_add(1, Ordering::Relaxed);
++    let forced = FORCED.fetch_add(1, Ordering::Relaxed) + 1;
+     if forced <= 32 || forced.is_power_of_two() {
+         let waits = match queue.lock().ops.front() {
+@@ -364,5 +413,18 @@
+     }
+ 
+-    /// A value the CPU writes wakes the queue, and a wait never met does not
++    #[test]
++    fn local_dispatch_preserves_cross_queue_dependencies() {
++        let (a, b) = (Timeline::new(), Timeline::new());
++        let at = Arc::new(AtomicU64::new(0));
++        let log = Log::default();
++        a.submit_inner(op(&at, &log, &[(0, 1)]), true);
++        a.submit_inner(op(&at, &log, &[(2, 3)]), true);
++        assert_eq!(at.load(Ordering::Acquire), 1);
++        b.submit_inner(op(&at, &log, &[(1, 2)]), true);
++        until(|| a.idle() && b.idle());
++        assert_eq!(*log.lock().unwrap(), [(0, 1), (1, 2), (2, 3)]);
++    }
++
++    /// A value the CPU writes wakes the queue, and a wait never met does not
+     /// hold it back for good.
+     #[test]
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -128,5 +128,5 @@
+ impl crate::timeline::Lists for Submission {
+     fn ready(&self) -> usize {
+-        self.runs.iter().take_while(|l| l.unmet().is_empty()).count()
++        self.runs.iter().take_while(|l| l.waits_met()).count()
+     }
+     fn len(&self) -> usize {
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2317,6 +2317,22 @@
+     }
+ 
+-    /// The waits of the list that are not met yet, apart from those its own
+-    /// earlier writes meet.
++    /// Fast predicate for the queue scheduler. Stop at the first unmet
++    /// wait instead of allocating a vector and checking the remaining waits.
++    pub(crate) fn waits_met(&self) -> bool {
++        let deferred = self.deferred();
++        deferred.waits.iter().all(|(before, wait)| {
++            let own = deferred.writes[..*before]
++                .iter()
++                .rev()
++                .find(|w| w.0 == wait.address);
++            match own {
++                Some((_, crate::queue::Written::Value(v), _)) => wait.met(*v),
++                _ => wait.met(wait.value()),
++            }
++        })
++    }
++
++    /// The waits of the list that are not met yet, apart from those its own
++    /// earlier writes meet.
+     pub(crate) fn unmet(&self) -> Vec<crate::memwait::Wait> {
+         let deferred = self.deferred();
+@@ -3418,6 +3434,7 @@
+             log_gpu_waits();
+             #[cfg(feature = "diagnostics")]
+-            log_gpu_times();
+-            tracing::info!(
++            log_gpu_times();
++            crate::timeline::log_perf();
++            tracing::info!(
+                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
+                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
