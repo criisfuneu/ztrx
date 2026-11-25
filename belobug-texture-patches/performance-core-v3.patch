@@ -168,7 +168,7 @@ diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
 -        }
 -    }
 -
--    /// After every list's steps
+-    /// After every list's steps (no title copy follows): each directly
 +            if let Some((s, a, b)) = run.replace((shadow, from, to)) {
 +                if parallel { merged.push((s, a, b)); } else { update(&s, a, b - a); }
 +            }
@@ -209,7 +209,7 @@ diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
 +        }
 +    }
 +
-+    /// After every list's steps
++    /// After every list's steps (no title copy follows): each directly
      /// indexed heap's slots, once per submission however many lists and
      /// draws use it. What they read is refreshed (unchanged pages cost only
 @@ -3419,6 +3453,7 @@
