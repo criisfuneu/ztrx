@@ -1,0 +1,138 @@
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -1036,6 +1036,11 @@ thread_local! {
+ 
+ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
++    if matches!(i.fields, Fields::Sop { .. })
++        && i.read(Reg::Scc).is_some_and(|v| st.scc_some.contains_key(&v))
++    {
++        return true;
++    }
+     let ops: Vec<&Operand> = match &i.fields {
+         // A mask operation (its result a mask) is no data use.
+         Fields::Sop { .. }
+@@ -1262,6 +1267,12 @@ impl<'a> Lower<'a> {
+             // Code reading other lanes needs the console's wave size and
+             // lane order; so do lane masks read as numbers, and LDS shared
+             // within one wave, where the console compiler leaves out barriers.
++            let scc_phi_mask = p.blocks.iter().any(|b| {
++                b.phis.iter().any(|phi| {
++                    phi.reg == Reg::Scc
++                        && phi.args.iter().any(|v| x.st.scc_some.contains_key(v))
++                })
++            });
+             console_lanes = insts().any(|i| {
+                 let n = i.name();
+                 n.starts_with("ds_swizzle")
+@@ -1271,7 +1282,8 @@ impl<'a> Lower<'a> {
+                     || n.starts_with("v_permlane")
+                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                     || reads_mask_as_data(x.st, i)
+-            }) || lane_constant_masks(x.st)
++            }) || scc_phi_mask
++                || lane_constant_masks(x.st)
+                 // (a branch the wave takes together asks the wave)
+                 || !x.st.wide.is_empty();
+             let mut wave = if x.native.wave64 { 64 } else { 32 };
+@@ -1293,7 +1305,8 @@ impl<'a> Lower<'a> {
+                         || n.starts_with("ds_permute")
+                         || n.starts_with("ds_bpermute")
+                         || reads_mask_as_data(x.st, i)
+-                }) || lane_constant_masks(x.st)
++                }) || scc_phi_mask
++                    || lane_constant_masks(x.st)
+                     || !x.st.wide.is_empty();
+                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                     wave = 32;
+@@ -2449,6 +2462,13 @@ impl<'a> Lower<'a> {
+             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
+                 return self.mask_dword(v).map(Val::I32);
+             }
++            Some(&Val::Missing(_)) | None
++                if self.mask_ok
++                    && self.mask_data == MaskData::Console
++                    && self.x.st.scc_some.contains_key(&v) =>
++            {
++                return self.scc_some(v).map(Val::Bit);
++            }
+             Some(&Val::Missing(w)) => return Err(w),
+             Some(&val) => return Ok(val),
+             None => {}
+@@ -3725,8 +3745,12 @@ impl<'a> Lower<'a> {
+     /// exchange theirs, which needs every lane there.
+     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
+         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
+-        // (not for a console wave cut into host waves that do not exchange)
+-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
++        // (not for a console wave cut into host waves that do not exchange,
++        // unless `local_any` takes every mask read per host wave)
++        if !self.console_lanes
++            || self.local && !self.local_any
++            || self.exchange.is_none() && self.halves.is_some()
++        {
+             return Err(LANE_MASK);
+         }
+         let made = self.def_block.get(&scc).copied();
+@@ -3739,7 +3763,7 @@ impl<'a> Lower<'a> {
+         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
+         self.s.flags |= flags::WAVE_OPS;
+-        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
++        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
+             return Ok(some);
+         }
+         if !made.is_none_or(|b| self.all_lanes(b)) {
+
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -986,6 +986,47 @@ mod tests {
+         assert!(e.contains("a carry-in from an untracked mask"), "{e}");
+     }
+ 
++    /// A wave64 compute program reading SCC of a mask operation (`scc_some`)
++    /// inside a divergent per-lane branch on a 32-lane host: exchanging the
++    /// two halves' answers needs every lane there, so `emit` falls back to
++    /// `with_local_waves_any` and takes each host wave's `WaveAnyTrue`.
++    #[test]
++    fn scc_some_in_a_divergent_branch_lowers_per_host_wave_on_wave32() {
++        // Direct read (`s_and_b64` -> `s_cselect_b32`) and scalar-skip phi join
++        // inside a per-lane divergent branch (`s_and_saveexec_b64`).
++        let direct = [
++            0x7E02_0287, // v_mov_b32 v1, 7
++            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
++            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
++            0xBF88_0004, // s_cbranch_execz 4
++            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
++            0x8784_6A7E, // s_and_b64 s[4:5], exec, vcc (sets SCC in scc_some)
++            0x8506_8789, // s_cselect_b32 s6, 9, 7
++            0x7E02_0206, // v_mov_b32 v1, s6
++            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
++        ];
++        let joined = [
++            0x7E02_0287, // v_mov_b32 v1, 7
++            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
++            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
++            0xBF88_0006, // s_cbranch_execz 6
++            0xBF06_8000, // s_cmp_eq_u32 s0, 0
++            0xBF84_0002, // s_cbranch_scc0 2 (uniform skip, SCC = 0)
++            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
++            0x8784_6A7E, // s_and_b64 s[4:5], exec, vcc (sets SCC in scc_some)
++            0x8506_8789, // s_cselect_b32 s6, 9, 7 (reads joined SCC phi)
++            0x7E02_0206, // v_mov_b32 v1, s6
++            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
++        ];
++        for body in [&direct[..], &joined[..]] {
++            stores_v1(body).unwrap();
++            lower::TEST_HOST_WAVE.set(Some(32));
++            let res = stores_v1(body);
++            lower::TEST_HOST_WAVE.set(None);
++            res.unwrap();
++        }
++    }
++
+     /// A pixel shader writing a constant colour.
+     #[cfg(windows)]
+     fn constant_color() -> Vec<u8> {
