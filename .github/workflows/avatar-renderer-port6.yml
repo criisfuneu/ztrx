@@ -1,0 +1,67 @@
+name: Avatar renderer port 6 isolated
+on:
+  push:
+    branches: [avatar-renderer-port6-isolated]
+    paths: ['.github/workflows/avatar-renderer-port6.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout pinned upstream source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: avatarmanz/VIctory-7900XTX
+          ref: a9400a6d62ccc8309dab9a5f38a2eb730ce176aa
+          path: runtime
+          persist-credentials: false
+      - name: Verify source and compile upstream diagnostics profile
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = git rev-parse HEAD
+          if ($actual -ne 'a9400a6d62ccc8309dab9a5f38a2eb730ce176aa') { throw 'Unexpected source revision' }
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.1 build --locked --profile diag -p victory --features diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package for isolated evaluation only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist/target/diag,dist/scripts | Out-Null
+          Copy-Item runtime/target/diag/victory.exe dist/target/diag/
+          Copy-Item runtime/README.md,runtime/LICENSE dist/
+          Copy-Item runtime/scripts/play.ps1 dist/scripts/
+          $manifest = [ordered]@{
+            upstream = 'avatarmanz/VIctory-7900XTX'
+            commit = 'a9400a6d62ccc8309dab9a5f38a2eb730ce176aa'
+            build = 'upstream diag profile, diagnostics, locked dependencies, no local runtime patches'
+            control_commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            sha256 = (Get-FileHash dist/target/diag/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            security_review = 'Partial; host filesystem passthrough remains; not a security sandbox'
+            binary_executed_in_ci = $false
+            gpu_tested = $false
+            benchmark = 'Upstream README reports ~22 FPS on RX 7900 XTX / 64 GiB, not independently reproduced'
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content dist/source-info.json -Encoding utf8
+          @'
+          EXPERIMENTAL - NOT CLEARED FOR PERSONAL HOST.
+          Use only in a disposable isolated test environment with authorized test content, no credentials, no personal files or writable host shares.
+          Static review was partial. The runtime can pass through host file operations; it is not an isolation boundary.
+          Upstream reports roughly 30 GB private memory and recommends 64 GB RAM. Hardware results are not guaranteed.
+          This package has not been executed by CI. No game files, SDK DLLs, or hooks are packaged.
+          The original upstream launcher is provided unmodified for inspection.
+          Source: https://github.com/avatarmanz/VIctory-7900XTX/tree/a9400a6d62ccc8309dab9a5f38a2eb730ce176aa
+          '@ | Set-Content dist/LEIA-ANTES.txt -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avatar-renderer-port6-a9400a6-isolated-DIAG
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
