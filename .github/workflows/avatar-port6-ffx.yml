@@ -1,7 +1,7 @@
-name: Avatar Port 6 FFX bridge isolated
+name: Avatar Port 6 FFX PSO diagnostic
 on:
   push:
-    branches: [avatar-port6-ffx-bridge]
+    branches: [avatar-port6-ffx-pso-diag]
     paths: ['.github/workflows/avatar-port6-ffx.yml', 'avatar-port6-patches/**']
   workflow_dispatch:
 permissions:
@@ -34,6 +34,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pso = Join-Path $env:GITHUB_WORKSPACE 'control/avatar-port6-patches/pso-diagnostic.patch'
+          git apply --check $pso
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply $pso
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile diagnostic runtime
@@ -61,7 +66,7 @@ jobs:
           Copy-Item runtime/target/diag/victory.exe dist/target/diag/
           Copy-Item runtime/README.md,runtime/LICENSE dist/
           Copy-Item runtime/scripts/play.ps1 dist/scripts/
-          Copy-Item control/avatar-port6-patches/ffx-bridge.patch dist/
+          Copy-Item control/avatar-port6-patches/*.patch dist/
           [ordered]@{
             upstream = 'avatarmanz/VIctory-7900XTX'
             commit = 'a9400a6d62ccc8309dab9a5f38a2eb730ce176aa'
@@ -71,6 +76,7 @@ jobs:
             limitations = 'THIN, async submit and late wait disabled when SDK bridge enabled; SDK and GPU not tested in CI'
             sha256 = (Get-FileHash dist/target/diag/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
             security_review = 'Partial; no host filesystem isolation; unknown hooks not allowed'
+            pso_diagnostic = 'One general worker, zero extra screen workers by default; driver create/load markers. VICTORY_PSO_DIAGNOSTIC=0 restores worker policy; VICTORY_PSO_BYPASS_LIBRARY=1 independently bypasses persistent driver library.'
             gpu_tested = $false
             binary_executed_in_ci = $false
           } | ConvertTo-Json -Depth 4 | Set-Content dist/source-info.json -Encoding utf8
@@ -79,11 +85,12 @@ jobs:
           No SDK binaries, game files or third-party hooks are packaged.
           The FFX bridge is opt-in via VICTORY_FFX_DIR, an absolute directory containing the official signed PC FidelityFX SDK DLLs. Verify their Authenticode signatures independently before use.
           External SDK commands are recorded on real command lists. THIN, async submission and late wait are disabled with the bridge. Other upstream performance changes remain in the source, but the reported 22 fps configuration is not reproduced by this compatibility mode.
+          Single pipeline worker and driver call tracing are enabled by default. Persistent pipeline library remains enabled unless VICTORY_PSO_BYPASS_LIBRARY=1. No cache files are deleted and no shaders are skipped by this diagnostic patch.
           The GPU dispatch and SDK loading have not been validated in CI. No malware-free or gameplay guarantee.
           '@ | Set-Content dist/LEIA-ANTES.txt -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: avatar-port6-ffx-bridge-isolated-DIAG
+          name: avatar-port6-ffx-pso-isolated-DIAG
           path: dist/
           if-no-files-found: error
           retention-days: 7
