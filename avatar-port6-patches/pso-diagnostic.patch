@@ -1,0 +1,94 @@
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -79,7 +79,13 @@
+         self.made.get_or_init(|| {
+             let _building = crate::timeline::span("pipeline: build a host pipeline");
+             let began = Instant::now();
+-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
++            if pso_diagnostic() {
++                tracing::info!(key = %self.key, shaders = ?self.shaders, "PSO DIAG begin");
++            }
++            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
++            if pso_diagnostic() {
++                tracing::info!(key = %self.key, success = made.is_some(), ms = began.elapsed().as_millis() as u64, "PSO DIAG end");
++            }
+             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+             made
+         });
+@@ -402,7 +408,12 @@
+ /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
+ /// 64), else two thirds of the logical processors, 2 to 16. They run below the
+ /// title's own threads, and a cold cache queues hundreds at once.
+-fn worker_count(asked: Option<usize>, processors: usize) -> usize {
++fn pso_diagnostic() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_DIAGNOSTIC").is_none_or(|v| v != "0"))
++}
++
++fn worker_count(asked: Option<usize>, processors: usize) -> usize {
+     match asked {
+         Some(n) => n.clamp(1, 64),
+         None => (processors * 2 / 3).clamp(2, 16),
+@@ -420,8 +431,9 @@
+                 .and_then(|v| v.trim().parse().ok()),
+             std::thread::available_parallelism().map_or(2, |n| n.get()),
+         );
+-        tracing::info!(workers, "pipeline workers");
+-        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
++        let workers = if pso_diagnostic() { 1 } else { workers };
++        let screens = if screens_first() && !pso_diagnostic() { SCREEN_WORKERS } else { 0 };
++        tracing::info!(workers, screens, diagnostic = pso_diagnostic(), "pipeline workers");
+         for i in 0..workers + screens {
+             let screens_only = i >= workers;
+             let spawned = std::thread::Builder::new()
+diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
+--- a/crates/victory-gpu/src/pipeline/library.rs
++++ b/crates/victory-gpu/src/pipeline/library.rs
+@@ -442,7 +442,13 @@
+ /// Title pipelines listed for an early start, at most.
+ const EARLY_MAX: usize = 100_000;
+ 
+-fn library() -> Option<&'static Library> {
++fn library() -> Option<&'static Library> {
++    static BYPASS: OnceLock<bool> = OnceLock::new();
++    if *BYPASS.get_or_init(|| {
++        let on = std::env::var_os("VICTORY_PSO_BYPASS_LIBRARY").is_some_and(|v| v == "1");
++        if on { tracing::info!("PSO DIAG: persistent driver pipeline library disabled; no cache files deleted"); }
++        on
++    }) { return None; }
+     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+     LIBRARY
+         .get_or_init(|| {
+@@ -520,10 +526,14 @@
+     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+ ) -> windows::core::Result<ID3D12PipelineState> {
+-    let create = || {
+-        let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
+-        create()
+-    };
++    let create = || {
++        let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
++        let diagnostic = std::env::var_os("VICTORY_PSO_DIAGNOSTIC").is_none_or(|v| v != "0");
++        if diagnostic { tracing::info!(pso = name, "PSO DIAG driver create begin"); }
++        let made = create();
++        if diagnostic { tracing::info!(pso = name, success = made.is_ok(), "PSO DIAG driver create end"); }
++        made
++    };
+     let wide = HSTRING::from(name);
+     let Some(library) = library() else {
+         MADE.fetch_add(1, Ordering::Relaxed);
+@@ -536,7 +546,11 @@
+         let _one = same_name(name);
+         let _call = call("load", name);
+         loading.next("pipeline: load a PSO from the driver library");
+-        load(&library.library, PCWSTR(wide.as_ptr()))
++        let diagnostic = std::env::var_os("VICTORY_PSO_DIAGNOSTIC").is_none_or(|v| v != "0");
++        if diagnostic { tracing::info!(pso = name, "PSO DIAG driver load begin"); }
++        let loaded = load(&library.library, PCWSTR(wide.as_ptr()));
++        if diagnostic { tracing::info!(pso = name, success = loaded.is_ok(), "PSO DIAG driver load end"); }
++        loaded
+     };
+     // The load read the library's file (see `trim`).
+     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
