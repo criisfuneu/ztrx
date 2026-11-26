@@ -1138,7 +1138,7 @@ diff --git a/crates/victory-hle/src/modules/mod.rs b/crates/victory-hle/src/modu
  #[cfg(windows)]
  pub mod files;
  pub mod gameinput;
-@@ -71,7 +73,11 @@
+@@ -71,6 +73,10 @@
      #[cfg(windows)]
      all.push(xmem::module());
      #[cfg(windows)]
@@ -1151,7 +1151,6 @@ diff --git a/crates/victory-hle/src/modules/mod.rs b/crates/victory-hle/src/modu
 +    }
 +    all
  }
- 
 diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
 --- a/crates/victory-gpu/src/list.rs
 +++ b/crates/victory-gpu/src/list.rs
@@ -1177,10 +1176,10 @@ diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resourc
  /// lists that name it).
  #[cfg(windows)]
 -pub(crate) struct HostTexture {
--    pub(crate) texture:
+-    pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 +pub(crate) struct HostTexture {
 +    pub(crate) fsr_output: std::sync::OnceLock<Option<crate::ffx::rgb9e5::Output>>,
-+    pub(crate) texture:
++    pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
      pub(crate) state: std::sync::atomic::AtomicU32,
      /// The bytes the host gives it.
      bytes: u64,
@@ -1224,11 +1223,11 @@ diff --git a/crates/victory-gpu/src/list/thin.rs b/crates/victory-gpu/src/list/t
  
  /// Whether it is asked for.
 -pub(crate) fn wanted() -> bool {
--    static ON: OnceLock<bool>
+-    static ON: OnceLock<bool> = OnceLock::new();
 +pub(crate) fn wanted() -> bool {
 +    // The external FFX SDK records against a real list; no thin replay support yet.
 +    if crate::ffx::enabled() { return false; }
-+    static ON: OnceLock<bool>
++    static ON: OnceLock<bool> = OnceLock::new();
      *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
  }
  
@@ -1240,10 +1239,10 @@ diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/que
  /// (`VICTORY_ASYNC_SUBMIT=1`; needs flights with the present sent ahead, as
  /// the relay has them, and lists cut at their waits).
 -pub(super) fn on() -> bool {
--    // Diagnostics:
+-    // Diagnostics: on and off while the title runs (`crate::ab`).
 +pub(super) fn on() -> bool {
 +    if crate::ffx::enabled() { return false; }
-+    // Diagnostics:
++    // Diagnostics: on and off while the title runs (`crate::ab`).
      #[cfg(feature = "diagnostics")]
      if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
          return on && started();
@@ -1255,11 +1254,11 @@ diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
  
  /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
 -fn late_stage() -> u8 {
--    static STAGE: OnceLock<u8>
+-    static STAGE: OnceLock<u8> = OnceLock::new();
 +fn late_stage() -> u8 {
 +    // The SDK context and scratch lifetime must not outlive synchronous submissions.
 +    if crate::ffx::enabled() { return 0; }
-+    static STAGE: OnceLock<u8>
++    static STAGE: OnceLock<u8> = OnceLock::new();
      *STAGE.get_or_init(|| {
          if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
              return 0;
