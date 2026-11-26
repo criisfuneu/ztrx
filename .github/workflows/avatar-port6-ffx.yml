@@ -1,0 +1,89 @@
+name: Avatar Port 6 FFX bridge isolated
+on:
+  push:
+    branches: [avatar-port6-ffx-bridge]
+    paths: ['.github/workflows/avatar-port6-ffx.yml', 'avatar-port6-patches/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout integration patch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: control
+          persist-credentials: false
+      - name: Checkout exact upstream source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: avatarmanz/VIctory-7900XTX
+          ref: a9400a6d62ccc8309dab9a5f38a2eb730ce176aa
+          path: runtime
+          persist-credentials: false
+      - name: Apply bridge with exact context
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD) -ne 'a9400a6d62ccc8309dab9a5f38a2eb730ce176aa') { throw 'Unexpected upstream' }
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'control/avatar-port6-patches/ffx-bridge.patch'
+          git apply --check $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile diagnostic runtime
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.1 build --locked --profile diag -p victory --features diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile bridge unit tests and verify description parsing
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          cargo +1.98.1 test --locked --profile diag -p victory-gpu --features diagnostics create_takes_the_upscale_description_only_beside_the_console_backend -- --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.1 test --locked --profile diag -p victory-gpu --features diagnostics create_takes_the_upscale_description_only_beside_the_console_backend
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package isolated test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist/target/diag,dist/scripts | Out-Null
+          Copy-Item runtime/target/diag/victory.exe dist/target/diag/
+          Copy-Item runtime/README.md,runtime/LICENSE dist/
+          Copy-Item runtime/scripts/play.ps1 dist/scripts/
+          Copy-Item control/avatar-port6-patches/ffx-bridge.patch dist/
+          [ordered]@{
+            upstream = 'avatarmanz/VIctory-7900XTX'
+            commit = 'a9400a6d62ccc8309dab9a5f38a2eb730ce176aa'
+            control_commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            bridge = 'V9/V8 FidelityFX HLE; adapted native list states, tile writes and binding restoration'
+            limitations = 'THIN, async submit and late wait disabled when SDK bridge enabled; SDK and GPU not tested in CI'
+            sha256 = (Get-FileHash dist/target/diag/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            security_review = 'Partial; no host filesystem isolation; unknown hooks not allowed'
+            gpu_tested = $false
+            binary_executed_in_ci = $false
+          } | ConvertTo-Json -Depth 4 | Set-Content dist/source-info.json -Encoding utf8
+          @'
+          EXPERIMENTAL: ISOLATED AUTHORIZED TEST CONTENT ONLY.
+          No SDK binaries, game files or third-party hooks are packaged.
+          The FFX bridge is opt-in via VICTORY_FFX_DIR, an absolute directory containing the official signed PC FidelityFX SDK DLLs. Verify their Authenticode signatures independently before use.
+          External SDK commands are recorded on real command lists. THIN, async submission and late wait are disabled with the bridge. Other upstream performance changes remain in the source, but the reported 22 fps configuration is not reproduced by this compatibility mode.
+          The GPU dispatch and SDK loading have not been validated in CI. No malware-free or gameplay guarantee.
+          '@ | Set-Content dist/LEIA-ANTES.txt -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avatar-port6-ffx-bridge-isolated-DIAG
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
