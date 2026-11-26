@@ -1,0 +1,381 @@
+diff --git a/crates/victory-gpu/src/timeline.rs b/crates/victory-gpu/src/timeline.rs
+--- a/crates/victory-gpu/src/timeline.rs
++++ b/crates/victory-gpu/src/timeline.rs
+@@ -19,8 +19,11 @@
+     /// How many of the first may run now: those that wait for nothing (what
+     /// an earlier one writes counts once that ran).
+     fn ready(&self) -> usize;
+-    fn len(&self) -> usize;
+-    /// Writes what the first, not ready, writes before its wait, if it does
++    fn len(&self) -> usize;
++    // V12: a backend may merge an adjacent, independently eligible submission.
++    fn try_join(&mut self, _next: &mut dyn Lists) -> bool { false }
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> { None }
++    /// Writes what the first, not ready, writes before its wait, if it does
+     /// no work before that; whether it wrote anything. Two queues may meet
+     /// this way halfway through a list each.
+     fn early(&mut self) -> bool {
+@@ -124,8 +127,25 @@
+         self.submit_inner(op, local_dispatch_enabled());
+     }
+ 
+-    fn submit_inner(&self, op: Op, local: bool) {
+-        self.lock().ops.push_back(op);
++    fn submit_inner(&self, mut op: Op, local: bool) {
++        {
++            let mut s = self.lock();
++            static JOIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++            static JOINED: AtomicU64 = AtomicU64::new(0);
++            let enabled = *JOIN.get_or_init(|| std::env::var_os("VICTORY_V12_JOIN_PARTS").is_some_and(|v| v == "1"));
++            let joined = enabled && match (s.ops.back_mut(), &mut op) {
++                (Some(Op::Lists(previous)), Op::Lists(next)) => previous.try_join(next.as_mut()),
++                _ => false,
++            };
++            if joined {
++                let n = JOINED.fetch_add(1, Ordering::Relaxed) + 1;
++                if n == 1 || n.is_power_of_two() {
++                    tracing::info!(n, "V12 joined adjacent independently eligible submissions");
++                }
++            } else {
++                s.ops.push_back(op);
++            }
++        }
+         // If another queue is already held, preserve the original global
+         // scheduling path. Otherwise run the newly submitted queue directly.
+         // Keep periodic global scans for retirement and catch-up.
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -129,10 +129,27 @@
+     fn ready(&self) -> usize {
+         self.runs.iter().take_while(|l| l.waits_met()).count()
+     }
+-    fn len(&self) -> usize {
+-        self.runs.len()
+-    }
+-    fn early(&mut self) -> bool {
++    fn len(&self) -> usize {
++        self.runs.len()
++    }
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> { Some(self) }
++    fn try_join(&mut self, next: &mut dyn crate::timeline::Lists) -> bool {
++        let Some(next) = next.as_any_mut().and_then(|v| v.downcast_mut::<Submission>()) else {
++            return false;
++        };
++        // Do not cross a signal, wait, callback, readback or title-memory step.
++        // Host::execute still submits each underlying GPU command list in order.
++        if !std::ptr::eq(self.host, next.host)
++            || self.runs.is_empty() || next.runs.is_empty()
++            || self.runs.len().saturating_add(next.runs.len()) > 8
++            || !self.runs.iter().chain(next.runs.iter()).all(|l| l.v12_joinable())
++        {
++            return false;
++        }
++        self.runs.append(&mut next.runs);
++        true
++    }
++    fn early(&mut self) -> bool {
+         self.runs.front().is_some_and(|l| l.write_early())
+     }
+     fn take(&mut self, n: usize) -> Box<dyn FnOnce()> {
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1462,59 +1462,92 @@
+         // which tell the title the GPU is done; each range once per
+         // submission, however many dispatches declared it (the world's
+         // passes declare the same big ranges dozens of times).
+-        let copying = std::time::Instant::now();
+-        if let Some(plan) = card_plan {
+-            if card_after_ran {
+-                if let Some(engine_lock) = self.card_engine() {
+-                    let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
+-                    let written = engine.finish_back(self, plan, &mut submitted);
+-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+-                } else {
+-                    plan.clear_pending();
+-                }
+-            } else {
+-                plan.clear_pending();
+-            }
+-        }
+-        let card_elapsed = copying.elapsed().as_micros() as u64;
+-        let back_started = std::time::Instant::now();
+-        let back = cpu_back;
+-        if back.len() <= 1 {
+-            for (shadow, address, len) in &back {
+-                let written = shadow.copy_back(*address, *len);
+-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+-            }
+-        } else {
+-            // Group by Shadow pointer so distinct shadows run in parallel
+-            // across CPU cores without lock contention on `before`/`pending`.
+-            let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
+-                Vec::new();
+-            let mut group_by_shadow = std::collections::HashMap::<usize, usize>::new();
+-            for item in back {
+-                let key = if crate::shadow::v7_indexed_pending() { item.0.root_key() } else { std::sync::Arc::as_ptr(&item.0) as usize };
+-                let index = *group_by_shadow.entry(key).or_insert_with(|| {
+-                    groups.push(Vec::new());
+-                    groups.len() - 1
+-                });
+-                groups[index].push(item);
+-            }
+-            if groups.len() <= 1 {
+-                for (shadow, address, len) in &groups[0] {
+-                    let written = shadow.copy_back(*address, *len);
+-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+-                }
+-            } else {
+-                in_parallel(&groups, 8, |chunk| {
+-                    for g in chunk {
+-                        for (shadow, address, len) in g {
+-                            let written = shadow.copy_back(*address, *len);
+-                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+-                        }
+-                    }
+-                });
+-            }
+-        }
+-        let shadow_elapsed = back_started.elapsed().as_micros() as u64;
++        let copying = std::time::Instant::now();
++        // Keep the original GPU fence, submission lock and completion order.
++        // Overlap only a card fetch with ordinary, private, nonoverlapping
++        // host-copy merges. Mapped physical views can alias and are excluded.
++        static RELAY: OnceLock<bool> = OnceLock::new();
++        static OVERLAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        let overlap = *RELAY.get_or_init(|| std::env::var_os("VICTORY_V12_RELAY").is_some_and(|v| v == "1"))
++            && card_after_ran && card_plan.is_some() && !card_writes.is_empty()
++            && cpu_back.len() >= 2 && cpu_back.len() <= 64
++            && cpu_back.iter().all(|(shadow, at, len)| {
++                !shadow.is_direct() && !shadow.is_sparse() && !shadow.is_card()
++                    && v12_private_span(*at, *len)
++                    && card_writes.iter().all(|(card, _, _)| {
++                        let (lo, hi) = card.v12_extent();
++                        v12_disjoint(*at as u64, *len as u64, lo, hi)
++                    })
++            });
++        let card_back = || {
++            let began = std::time::Instant::now();
++            if let Some(plan) = card_plan {
++                if card_after_ran {
++                    if let Some(engine_lock) = self.card_engine() {
++                        let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
++                        let written = engine.finish_back(self, plan, &mut submitted);
++                        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++                    } else {
++                        plan.clear_pending();
++                    }
++                } else {
++                    plan.clear_pending();
++                }
++            }
++            began.elapsed().as_micros() as u64
++        };
++        let merge_back = |back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>| {
++            let back_started = std::time::Instant::now();
++            if back.len() <= 1 {
++                for (shadow, address, len) in &back {
++                    let written = shadow.copy_back(*address, *len);
++                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++                }
++            } else {
++                // Group by Shadow pointer so distinct shadows run in parallel
++                // across CPU cores without lock contention on `before`/`pending`.
++                let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
++                    Vec::new();
++                let mut group_by_shadow = std::collections::HashMap::<usize, usize>::new();
++                for item in back {
++                    let key = if crate::shadow::v7_indexed_pending() { item.0.root_key() } else { std::sync::Arc::as_ptr(&item.0) as usize };
++                    let index = *group_by_shadow.entry(key).or_insert_with(|| {
++                        groups.push(Vec::new());
++                        groups.len() - 1
++                    });
++                    groups[index].push(item);
++                }
++                if groups.len() <= 1 {
++                    for (shadow, address, len) in &groups[0] {
++                        let written = shadow.copy_back(*address, *len);
++                        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++                    }
++                } else {
++                    in_parallel(&groups, 8, |chunk| {
++                        for g in chunk {
++                            for (shadow, address, len) in g {
++                                let written = shadow.copy_back(*address, *len);
++                                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++                            }
++                        }
++                    });
++                }
++            }
++            back_started.elapsed().as_micros() as u64
++        };
++        let (card_elapsed, shadow_elapsed) = if overlap {
++            let n = OVERLAPPED.fetch_add(1, Ordering::Relaxed) + 1;
++            if n == 1 || n.is_power_of_two() {
++                tracing::info!(n, "V12 private readback overlap");
++            }
++            std::thread::scope(|scope| {
++                let worker = scope.spawn(|| merge_back(cpu_back));
++                let card = card_back();
++                (card, worker.join().expect("V12 readback worker"))
++            })
++        } else {
++            (card_back(), merge_back(cpu_back))
++        };
+         let explicit_started = std::time::Instant::now();
+         for list in runs {
+             for rb in &list.deferred().readbacks {
+@@ -2176,9 +2209,17 @@
+         }
+     }
+ 
+-    fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
+-        self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+-    }
++    fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
++        self.deferred.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    /// The original execution has no CPU-visible preparation or completion
++    /// step to move. The queue may join only these closed lists.
++    pub(crate) fn v12_joinable(&self) -> bool {
++        let d = self.deferred();
++        d.copies.is_empty() && d.bindless.is_empty() && d.readbacks.is_empty()
++            && d.writes.is_empty() && d.waits.is_empty() && d.textures.is_empty()
++    }
+ 
+     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
+     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+@@ -3013,7 +3054,41 @@
+     }
+ }
+ 
+-// Exact contiguous fill joining, without changing allocation or queue order.
++// Only ordinary committed private memory is eligible for overlap. File
++// mappings and shared physical views may alias at different addresses.
++fn v12_private_span(at: usize, len: usize) -> bool {
++    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE};
++    let Some(end) = at.checked_add(len) else { return false; };
++    if len == 0 { return false; }
++    let mut here = at;
++    for _ in 0..64 {
++        if here >= end { return true; }
++        let mut info = MEMORY_BASIC_INFORMATION::default();
++        // SAFETY: query our own address space into a local structure.
++        if unsafe { VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0
++            || info.State != MEM_COMMIT || info.Type != MEM_PRIVATE
++        { return false; }
++        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
++        if next <= here { return false; }
++        here = next;
++    }
++    here >= end
++}
++
++fn v12_disjoint(at: u64, len: u64, lo: u64, hi: u64) -> bool {
++    at.checked_add(len).is_some_and(|end| len != 0 && lo < hi && (end <= lo || at >= hi))
++}
++
++#[cfg(test)]
++#[test]
++fn v12_overlap_checks_boundaries() {
++    assert!(v12_disjoint(0, 64, 64, 128));
++    assert!(!v12_disjoint(0, 65, 64, 128));
++    assert!(!v12_disjoint(u64::MAX, 2, 0, 64));
++    assert!(!v12_disjoint(64, 0, 0, 64));
++}
++
++// Exact contiguous fill joining, without changing allocation or queue order.
+ fn v11_join_fill(d: usize, s: usize, n: usize, dst: usize, src: usize, len: usize) -> Option<usize> {
+     let total = n.checked_add(len)?;
+     (n > 0 && len > 0 && total <= 128 * 1024
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -226,7 +226,30 @@
+ /// read them to.
+ const LARGE: u32 = 64;
+ 
+-// Adapted from the indexed table lookup experiment. Preserve first match.
++// V12: only aligned CBVs fully contained in an already opened, live direct
++// memory window. Keep the original scratch fallback for every other case.
++// This is the aligned subset, not the upstream raw-CBV translator port.
++fn v12_direct_constant(list: &HostList, address: u64, size: u32) -> Option<u64> {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    static USED: AtomicU64 = AtomicU64::new(0);
++    if !*ON.get_or_init(|| std::env::var_os("VICTORY_V12_PORT_CONSTANTS").is_some_and(|v| v == "1"))
++        || size == 0 || size > 65536 || address % 256 != 0
++    { return None; }
++    let bytes = u64::from(size.next_multiple_of(256));
++    let end = address.checked_add(bytes)?;
++    if end > (1u64 << 32) { return None; }
++    let shadow = crate::shadow::v12_existing_direct(address, end)?;
++    let gpu = shadow.gpu(address);
++    if gpu % 256 != 0 { return None; }
++    list.keep(&shadow.buffer);
++    let n = USED.fetch_add(1, Ordering::Relaxed) + 1;
++    if n == 1 || n.is_power_of_two() {
++        tracing::info!(n, "V12 aligned constant buffer in place");
++    }
++    Some(gpu)
++}
++
++// Adapted from the indexed table lookup experiment. Preserve first match.
+ fn v11_indexed_tables() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("VICTORY_V11_INDEXED_TABLES").is_some_and(|v| v == "1"))
+@@ -1327,8 +1350,12 @@
+                     entries.iter().find(|u| u.table_offset_dwords / 8 == k).copied()
+                 };
+                 match crate::descriptor::view(table + u64::from(k) * 32) {
+-                    Some(View::Constant(address, size)) => {
+-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
++                    Some(View::Constant(address, size)) => {
++                        if let Some(gpu) = v12_direct_constant(list, address, size) {
++                            host.constant_at(index, gpu, size);
++                            continue;
++                        }
++                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                             host.make_null_kind(index, ResourceType::Cbv, 4);
+                             continue;
+                         };
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -305,9 +305,13 @@
+         }
+     }
+ 
+-    pub(crate) fn is_card(&self) -> bool {
+-        self.card.is_some()
+-    }
++    pub(crate) fn is_card(&self) -> bool {
++        self.card.is_some()
++    }
++
++    pub(crate) fn v12_extent(&self) -> (u64, u64) {
++        (self.start, self.start.saturating_add(self.len))
++    }
+ 
+     pub(crate) fn card_state(&self) -> Option<Arc<crate::card::CardState>> {
+         self.card.clone()
+@@ -1115,7 +1119,16 @@
+     (start <= from && end >= to).then_some((start, end))
+ }
+ 
+-/// Whether `[address, end)` lies in a window made already.
++/// Bounds of this complete host copy (not just one declared write).
++pub(crate) fn v12_existing_direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
++    if address >= end { return None; }
++    windows_of_memory().range(..=address).rev().take(8)
++        .map(|(_, s)| s)
++        .find(|s| !s.is_dead() && s.start <= address && s.start.checked_add(s.len).is_some_and(|hi| end <= hi))
++        .cloned()
++}
++
++/// Whether `[address, end)` lies in a window made already.
+ pub(crate) fn in_place(address: u64, end: u64) -> bool {
+     windows_of_memory()
+         .range(..=address)
