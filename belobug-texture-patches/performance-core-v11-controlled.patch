@@ -28,11 +28,34 @@ diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
  
      /// Brings `[address, address + len)` of a buffer's host copy up to date
      /// when the list is submitted (once per range until a title copy
-@@ -3003,4 +3013,22 @@
+@@ -3003,30 +3013,51 @@
      }
  }
  
 -/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
+-pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
+-    const THREADS: usize = 6;
+-    if list.len() <= least {
+-        return f(list);
+-    }
+-    // Small pieces, taken in turn: they are not equally long to do.
+-    let piece = (list.len() / (THREADS * 8)).max(least);
+-    let next = std::sync::atomic::AtomicUsize::new(0);
+-    let work = || {
+-        loop {
+-            let from = next.fetch_add(piece, Ordering::Relaxed);
+-            if from >= list.len() {
+-                break;
+-            }
+-            f(&list[from..(from + piece).min(list.len())]);
+-        }
+-    };
+-    let threads = THREADS.min(list.len().div_ceil(piece));
+-    std::thread::scope(|s| {
+-        for _ in 1..threads {
+-            s.spawn(work);
+-        }
+-        work();
 +// Exact contiguous fill joining, without changing allocation or queue order.
 +fn v11_join_fill(d: usize, s: usize, n: usize, dst: usize, src: usize, len: usize) -> Option<usize> {
 +    let total = n.checked_add(len)?;
@@ -52,33 +75,35 @@ diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
 +}
 +
 +/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
-@@ -3008,4 +3036,7 @@
--    const THREADS: usize = 6;
--    if list.len() <= least {
++pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
 +    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 +    let threads_limit = *THREADS.get_or_init(|| {
 +        std::env::var("VICTORY_V11_COPY_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(6).clamp(1, 8)
 +    });
 +    if threads_limit == 1 || list.len() <= least {
-         return f(list);
-     }
-@@ -3011,6 +3042,6 @@
-     }
-     // Small pieces, taken in turn: they are not equally long to do.
--    let piece = (list.len() / (THREADS * 8)).max(least);
++        return f(list);
++    }
++    // Small pieces, taken in turn: they are not equally long to do.
 +    let piece = (list.len() / (threads_limit * 8)).max(least);
-     let next = std::sync::atomic::AtomicUsize::new(0);
-     let work = || {
-         loop {
-@@ -3021,7 +3052,7 @@
-             f(&list[from..(from + piece).min(list.len())]);
-         }
-     };
--    let threads = THREADS.min(list.len().div_ceil(piece));
++    let next = std::sync::atomic::AtomicUsize::new(0);
++    let work = || {
++        loop {
++            let from = next.fetch_add(piece, Ordering::Relaxed);
++            if from >= list.len() {
++                break;
++            }
++            f(&list[from..(from + piece).min(list.len())]);
++        }
++    };
 +    let threads = threads_limit.min(list.len().div_ceil(piece));
-     std::thread::scope(|s| {
-         for _ in 1..threads {
-             s.spawn(work);
++    std::thread::scope(|s| {
++        for _ in 1..threads {
++            s.spawn(work);
++        }
++        work();
+     });
+ }
+ 
 diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
 --- a/crates/victory-gpu/src/draw.rs
 +++ b/crates/victory-gpu/src/draw.rs
