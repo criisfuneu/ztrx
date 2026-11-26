@@ -1,0 +1,465 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1491,13 +1491,88 @@
+         && sweeps() == 0
+ }
+ 
+-pub(crate) fn log_sparse_perf() {
+-    let [ranges, lookups, bytes] = SPARSE_PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
+-    tracing::info!(ranges, lookups, bytes, "sparse cache performance interval");
+-    let [batches, pages, checked_bytes, changed_bytes, compare_us] =
+-        READBACK_COMPARE.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
+-    tracing::info!(batches, pages, checked_bytes, changed_bytes, compare_us, "parallel sparse readback interval");
+-    tracing::info!(duplicates = V7_PENDING_DUPLICATES.swap(0, Ordering::Relaxed), "V7 indexed pending interval");
++// V13: organize sparse memory work by root and byte coverage, not by
++// repeated shader write declarations. No GPU wait or title signal is moved.
++static V13_BATCH_STATS: [std::sync::atomic::AtomicU64; 6] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
++
++fn v13_batch_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_V13_SPARSE_BATCH").is_some_and(|v| v == "1"))
++        && sparse_cache_enabled() && v7_indexed_pending()
++}
++
++fn v13_snapshot_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_V13_SNAPSHOT_PLAN").is_some_and(|v| v == "1"))
++        && sparse_cache_enabled()
++}
++
++// Emit the as-yet uncovered bytes in first-declaration order. Never round
++// to pages, bridge a hole, or reorder distinct title-memory addresses.
++fn v13_uncovered(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
++    let mut covered = std::collections::BTreeMap::<usize, usize>::new();
++    let mut spans = Vec::new();
++    for &(at, len) in ranges {
++        let Some(end) = at.checked_add(len) else { continue; };
++        if len == 0 { continue; }
++        let first = covered.range(..=at).next_back()
++            .filter(|&(_, &b)| b >= at).map_or(at, |(&a, _)| a);
++        let touching: Vec<_> = covered.range(first..=end)
++            .map(|(&a, &b)| (a, b)).collect();
++        let (mut lo, mut hi, mut cursor) = (at, end, at);
++        for (a, b) in touching {
++            if cursor < a.min(end) { spans.push((cursor, a.min(end) - cursor)); }
++            cursor = cursor.max(b);
++            lo = lo.min(a);
++            hi = hi.max(b);
++            covered.remove(&a);
++        }
++        if cursor < end { spans.push((cursor, end - cursor)); }
++        covered.insert(lo, hi);
++    }
++    spans
++}
++
++#[cfg(test)]
++#[test]
++fn v13_coverage_is_exact_and_first_seen() {
++    assert_eq!(v13_uncovered(&[(10, 10), (5, 20), (12, 4), (30, 2)]),
++        vec![(10, 10), (5, 5), (20, 5), (30, 2)]);
++    let ranges = [(17, 15), (3, 5), (0, 40), (7, 3), (40, 4), (60, 2)];
++    let mut expected = Vec::new();
++    let mut seen = std::collections::HashSet::new();
++    for (a, n) in ranges { for i in a..a+n { if seen.insert(i) { expected.push(i); } } }
++    let got: Vec<_> = v13_uncovered(&ranges).into_iter().flat_map(|(a,n)| a..a+n).collect();
++    assert_eq!(got, expected);
++    assert!(v13_uncovered(&[(usize::MAX, 2), (3, 0)]).is_empty());
++}
++
++pub(crate) fn copy_back_group(group: &[(Arc<Shadow>, usize, usize)]) -> usize {
++    if v13_batch_enabled() && group.len() > 1 {
++        if let Some((root, sparse)) = group[0].0.sparse_root() {
++            if group.iter().all(|(s, a, n)| {
++                s.root_key() == root.root_key()
++                    && (*a as u64) >= root.start
++                    && a.checked_add(*n).is_some_and(|end| (end as u64) <= root.start.saturating_add(root.len))
++            }) {
++                let ranges: Vec<_> = group.iter().map(|(_, a, n)| (*a, *n)).collect();
++                return root.sparse_back_ranges(sparse, &ranges, true);
++            }
++        }
++    }
++    group.iter().map(|(s, a, n)| s.copy_back(*a, *n)).sum()
++}
++
++pub(crate) fn log_sparse_perf() {
++    let [ranges, lookups, bytes] = SPARSE_PERF.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(ranges, lookups, bytes, "sparse cache performance interval");
++    let [batches, pages, checked_bytes, changed_bytes, compare_us] =
++        READBACK_COMPARE.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(batches, pages, checked_bytes, changed_bytes, compare_us, "parallel sparse readback interval");
++    tracing::info!(duplicates = V7_PENDING_DUPLICATES.swap(0, Ordering::Relaxed), "V7 indexed pending interval");
++    let [roots, declarations, declared_bytes, unique_bytes, snapshot_hits, fallbacks] = V13_BATCH_STATS.each_ref().map(|v| v.swap(0, Ordering::Relaxed));
++    tracing::info!(roots, declarations, declared_bytes, unique_bytes, snapshot_hits, fallbacks, "V13 sparse work plan interval");
+ }
+ 
+ // Comparison-only workers: GPU completion and original serial write-back
+@@ -2057,138 +2132,205 @@
+             SPARSE_PERF[1].fetch_add(pages as u64, Ordering::Relaxed);
+             return;
+         }
+-        let mut visited = 0usize;
+-        self.each_tile(s, address, end, |at, data, _| {
+-            visited += 1;
+-            let tile = ((at - start) / PAGE) as u32;
+-            before.tiles.entry(tile).or_insert_with(|| {
+-                #[cfg(feature = "diagnostics")]
+-                SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
+-                let whole = data as usize & !(PAGE - 1);
+-                let mut buf = pooled_tile();
+-                // SAFETY: the tile's mapping.
+-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
+-                SparseSnapshot { bytes: buf, unchanged: false }
+-            });
+-        });
+-        // Only cache fully visited ranges; failed allocations must be retried.
+-        if cache && visited == pages && before.covered.len() < 4096 {
+-            before.covered.insert((address, end));
+-        }
+-    }
+-
+-    /// [`Shadow::copy_back`] of a sparse copy.
+-    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+-        let start = self.start as usize;
+-        let mut written = 0;
+-        let mut title: Option<Vec<u8>> = None;
+-        let cache = sparse_cache_enabled();
+-        let mut skipped = 0u64;
+-        // Compare large ranges across cores, before merging any modified bytes.
+-        // The before lock serializes aliases of this root; tile sweeping is off.
+-        // Only immutable reads occur in workers. The original merge and title
+-        // writes below remain serial, in the original address order.
+-        let permit = ReadbackPermit::try_take(len);
+-        let compared = permit.as_ref().map(|_| {
+-            let started = std::time::Instant::now();
+-            let mut jobs = Vec::with_capacity(len.div_ceil(PAGE).min(32768));
+-            self.each_tile(s, address, address + len, |at, data, n| {
+-                jobs.push((at, data as usize, n, std::sync::atomic::AtomicU8::new(0)));
+-            });
+-            let snapshots = &before.tiles;
+-            crate::host::in_parallel(&jobs, 32, |chunk| {
+-                for (at, data, n, status) in chunk {
+-                    let Some(old) = snapshots.get(&(((*at - start) / PAGE) as u32)) else { continue };
+-                    if cache && old.unchanged {
+-                        status.store(1, Ordering::Relaxed);
+-                        continue;
+-                    }
+-                    // SAFETY: mapping is live for this call, GPU is finished,
+-                    // before lock excludes other readbacks of this sparse root.
+-                    let current = unsafe { std::slice::from_raw_parts(*data as *const u8, *n) };
+-                    let off = *at % PAGE;
+-                    status.store(if current == &old.bytes[off..off + *n] { 1 } else { 2 }, Ordering::Relaxed);
+-                }
+-            });
+-            let mut checked = 0u64;
+-            let mut changed = 0u64;
+-            for (_, _, n, status) in &jobs {
+-                let status = status.load(Ordering::Relaxed);
+-                if status != 0 { checked += *n as u64; }
+-                if status == 2 { changed += *n as u64; }
+-            }
+-            READBACK_COMPARE[0].fetch_add(1, Ordering::Relaxed);
+-            READBACK_COMPARE[1].fetch_add(jobs.len() as u64, Ordering::Relaxed);
+-            READBACK_COMPARE[2].fetch_add(checked, Ordering::Relaxed);
+-            READBACK_COMPARE[3].fetch_add(changed, Ordering::Relaxed);
+-            READBACK_COMPARE[4].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+-            jobs
+-        });
+-        drop(permit);
+-        let mut process = |at: usize, data: *mut u8, n: usize, comparison: u8| {
+-            let Some(snapshot) = before.tiles.get_mut(&(((at - start) / PAGE) as u32)) else {
+-                return;
+-            };
+-            if cache && snapshot.unchanged {
+-                skipped += n as u64;
+-                return;
+-            }
+-            let old = &mut snapshot.bytes[at % PAGE..at % PAGE + n];
+-            // SAFETY: the tile's mapping; only this thread writes it.
+-            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
+-            #[cfg(feature = "diagnostics")]
+-            SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+-            if comparison == 1 || (comparison == 0 && host == old) {
+-                if cache && at % PAGE == 0 && n == PAGE {
+-                    snapshot.unchanged = true;
+-                }
+-                return;
+-            }
+-            #[cfg(feature = "diagnostics")]
+-            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+-            let buf = title.get_or_insert_with(|| {
+-                let mut v = pooled(PAGE);
+-                v.resize(PAGE, 0);
+-                v
+-            });
+-            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+-                return;
+-            }
+-            if let Some((dirty_start, dirty_end)) =
+-                merge_gpu_writes_mut(&mut buf[..n], host, old)
+-            {
+-                let dirty_len = dirty_end - dirty_start;
+-                crate::watch::writing(at + dirty_start, dirty_len);
+-                crate::host::write_mapped(
+-                    (at + dirty_start) as *mut u8,
+-                    buf[dirty_start..].as_ptr(),
+-                    dirty_len,
+-                );
+-                written += dirty_len;
+-            }
+-        };
+-        if let Some(jobs) = compared {
+-            for (at, data, n, status) in jobs {
+-                process(at, data as *mut u8, n, status.into_inner());
+-            }
+-        } else {
+-            self.each_tile(s, address, address + len, |at, data, n| process(at, data, n, 0));
+-        }
+-        if let Some(buf) = title {
+-            give_back(buf);
+-        }
+-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+-        pending.retain(|&r| r != (address, address + len));
+-        before.pending_index.remove(&(address, address + len));
+-        SPARSE_PERF[2].fetch_add(skipped, Ordering::Relaxed);
+-        if pending.is_empty() {
+-            before.pending_index.clear();
+-            before.covered.clear();
+-            give_back_tiles(before.tiles.drain().map(|(_, snapshot)| snapshot.bytes));
+-        }
+-        written
+-    }
++        let mut visited = 0usize;
++        if v13_snapshot_enabled() {
++            // The snapshots already identify exactly the tiles captured in
++            // this submission. Tile sweeping is disabled; existing snapshots
++            // do not need another mapping lookup or another allocation.
++            let mut at = address;
++            let mut hits = 0u64;
++            while at < end {
++                let n = (PAGE - at % PAGE).min(end - at);
++                let tile = ((at - start) / PAGE) as u32;
++                if before.tiles.contains_key(&tile) {
++                    visited += 1;
++                    hits += 1;
++                } else if let Some(data) = self.tile(s, at) {
++                    visited += 1;
++                    let mut buf = pooled_tile();
++                    // SAFETY: this live tile's whole mapping; the original
++                    // snapshot would take exactly these bytes.
++                    buf.extend_from_slice(unsafe { std::slice::from_raw_parts(data as *const u8, PAGE) });
++                    before.tiles.insert(tile, SparseSnapshot { bytes: buf, unchanged: false });
++                    #[cfg(feature = "diagnostics")]
++                    SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
++                }
++                at += n;
++            }
++            V13_BATCH_STATS[4].fetch_add(hits, Ordering::Relaxed);
++        } else {
++            self.each_tile(s, address, end, |at, data, _| {
++                visited += 1;
++                let tile = ((at - start) / PAGE) as u32;
++                before.tiles.entry(tile).or_insert_with(|| {
++                    #[cfg(feature = "diagnostics")]
++                    SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
++                    let whole = data as usize & !(PAGE - 1);
++                    let mut buf = pooled_tile();
++                    // SAFETY: the tile's mapping.
++                    buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
++                    SparseSnapshot { bytes: buf, unchanged: false }
++                });
++            });
++        }
++        // Only cache fully visited ranges; failed allocations must be retried.
++        if cache && visited == pages && before.covered.len() < 4096 {
++            before.covered.insert((address, end));
++        }
++    }
++
++    /// [`Shadow::copy_back`] of a sparse copy.
++    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
++        self.sparse_back_ranges(s, &[(address, len)], false)
++    }
++
++    fn sparse_back_ranges(&self, s: &Sparse, ranges: &[(usize, usize)], bulk: bool) -> usize {
++        let merged;
++        let spans = if bulk { merged = v13_uncovered(ranges); merged.as_slice() } else { ranges };
++        let len = spans.iter().fold(0usize, |n, &(_, bytes)| n.saturating_add(bytes));
++        if bulk {
++            V13_BATCH_STATS[0].fetch_add(1, Ordering::Relaxed);
++            V13_BATCH_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
++            V13_BATCH_STATS[2].fetch_add(ranges.iter().fold(0u64, |n, &(_, bytes)| n.saturating_add(bytes as u64)), Ordering::Relaxed);
++            V13_BATCH_STATS[3].fetch_add(len as u64, Ordering::Relaxed);
++        }
++        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
++        let start = self.start as usize;
++        let mut written = 0;
++        let mut title: Option<Vec<u8>> = None;
++        let cache = sparse_cache_enabled();
++        let mut skipped = 0u64;
++        // Compare large ranges across cores, before merging any modified bytes.
++        // The before lock serializes aliases of this root; tile sweeping is off.
++        // Only immutable reads occur in workers. The original merge and title
++        // writes below remain serial, in the original address order.
++        let permit = ReadbackPermit::try_take(len);
++        let compared = permit.as_ref().map(|_| {
++            let started = std::time::Instant::now();
++            let mut jobs = Vec::with_capacity(len.div_ceil(PAGE).min(32768));
++            for &(address, bytes) in spans {
++                self.each_tile(s, address, address + bytes, |at, data, n| {
++                    jobs.push((at, data as usize, n, std::sync::atomic::AtomicU8::new(0)));
++                });
++            }
++            let snapshots = &before.tiles;
++            crate::host::in_parallel(&jobs, 32, |chunk| {
++                for (at, data, n, status) in chunk {
++                    let Some(old) = snapshots.get(&(((*at - start) / PAGE) as u32)) else { continue };
++                    if cache && old.unchanged {
++                        status.store(1, Ordering::Relaxed);
++                        continue;
++                    }
++                    // SAFETY: mapping is live for this call, GPU is finished,
++                    // before lock excludes other readbacks of this sparse root.
++                    let current = unsafe { std::slice::from_raw_parts(*data as *const u8, *n) };
++                    let off = *at % PAGE;
++                    status.store(if current == &old.bytes[off..off + *n] { 1 } else { 2 }, Ordering::Relaxed);
++                }
++            });
++            let mut checked = 0u64;
++            let mut changed = 0u64;
++            for (_, _, n, status) in &jobs {
++                let status = status.load(Ordering::Relaxed);
++                if status != 0 { checked += *n as u64; }
++                if status == 2 { changed += *n as u64; }
++            }
++            READBACK_COMPARE[0].fetch_add(1, Ordering::Relaxed);
++            READBACK_COMPARE[1].fetch_add(jobs.len() as u64, Ordering::Relaxed);
++            READBACK_COMPARE[2].fetch_add(checked, Ordering::Relaxed);
++            READBACK_COMPARE[3].fetch_add(changed, Ordering::Relaxed);
++            READBACK_COMPARE[4].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
++            jobs
++        });
++        drop(permit);
++        let mut failed = false;
++        let mut visited = 0usize;
++        let mut process = |at: usize, data: *mut u8, n: usize, comparison: u8| {
++            visited = visited.saturating_add(n);
++            let Some(snapshot) = before.tiles.get_mut(&(((at - start) / PAGE) as u32)) else {
++                failed = true;
++                return;
++            };
++            if cache && snapshot.unchanged {
++                skipped += n as u64;
++                return;
++            }
++            let old = &mut snapshot.bytes[at % PAGE..at % PAGE + n];
++            // SAFETY: the tile's mapping; only this thread writes it.
++            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
++            #[cfg(feature = "diagnostics")]
++            SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
++            if comparison == 1 || (comparison == 0 && host == old) {
++                if cache && at % PAGE == 0 && n == PAGE {
++                    snapshot.unchanged = true;
++                }
++                return;
++            }
++            #[cfg(feature = "diagnostics")]
++            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
++            let buf = title.get_or_insert_with(|| {
++                let mut v = pooled(PAGE);
++                v.resize(PAGE, 0);
++                v
++            });
++            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
++                failed = true;
++                return;
++            }
++            if let Some((dirty_start, dirty_end)) =
++                merge_gpu_writes_mut(&mut buf[..n], host, old)
++            {
++                let dirty_len = dirty_end - dirty_start;
++                crate::watch::writing(at + dirty_start, dirty_len);
++                crate::host::write_mapped(
++                    (at + dirty_start) as *mut u8,
++                    buf[dirty_start..].as_ptr(),
++                    dirty_len,
++                );
++                written += dirty_len;
++            }
++        };
++        if let Some(jobs) = compared {
++            for (at, data, n, status) in jobs {
++                process(at, data as *mut u8, n, status.into_inner());
++            }
++        } else {
++            for &(address, bytes) in spans {
++                self.each_tile(s, address, address + bytes, |at, data, n| process(at, data, n, 0));
++            }
++        }
++        if let Some(buf) = title {
++            give_back(buf);
++        }
++        SPARSE_PERF[2].fetch_add(skipped, Ordering::Relaxed);
++        // Missing snapshots, mappings or unreadable title memory must retain
++        // the original per-declaration retry behavior. Already landed bytes
++        // compare equal to their updated snapshots.
++        if bulk && (failed || visited != len) {
++            V13_BATCH_STATS[5].fetch_add(1, Ordering::Relaxed);
++            drop(before);
++            for &(address, bytes) in ranges {
++                written += self.sparse_back(s, address, bytes);
++            }
++            return written;
++        }
++        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
++        if bulk {
++            let finished: std::collections::HashSet<_> = ranges.iter().map(|&(a, n)| (a, a+n)).collect();
++            pending.retain(|r| !finished.contains(r));
++            for r in &finished { before.pending_index.remove(r); }
++        } else {
++            let (address, bytes) = ranges[0];
++            pending.retain(|&r| r != (address, address + bytes));
++            before.pending_index.remove(&(address, address + bytes));
++        }
++        if pending.is_empty() {
++            before.pending_index.clear();
++            before.covered.clear();
++            give_back_tiles(before.tiles.drain().map(|(_, snapshot)| snapshot.bytes));
++        }
++        written
++    }
+ }
+ 
+ /// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1518,17 +1518,13 @@
+                     groups[index].push(item);
+                 }
+                 if groups.len() <= 1 {
+-                    for (shadow, address, len) in &groups[0] {
+-                        let written = shadow.copy_back(*address, *len);
+-                        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+-                    }
+-                } else {
+-                    in_parallel(&groups, 8, |chunk| {
+-                        for g in chunk {
+-                            for (shadow, address, len) in g {
+-                                let written = shadow.copy_back(*address, *len);
+-                                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+-                            }
++                    let written = crate::shadow::copy_back_group(&groups[0]);
++                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++                } else {
++                    in_parallel(&groups, 8, |chunk| {
++                        for g in chunk {
++                            let written = crate::shadow::copy_back_group(g);
++                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                         }
+                     });
+                 }
