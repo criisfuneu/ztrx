@@ -1,0 +1,100 @@
+name: AMD AvatarManz experimental diagnostics (isolated)
+
+on:
+  push:
+    branches: [amd-avatar-benchmark-20261126]
+    paths: ['.github/workflows/amd-avatar-benchmark.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amd-avatar-benchmark
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout our control repository without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact public upstream revision
+        uses: actions/checkout@v4
+        with:
+          repository: avatarmanz/VIctory-7900XTX
+          ref: f249fe05458ffaadd4b2a6e479a9cf902a377420
+          path: runtime
+          persist-credentials: false
+
+      - name: Verify pinned revision and toolchain
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne 'f249fe05458ffaadd4b2a6e479a9cf902a377420') { throw "Unexpected source commit $actual" }
+          rustup toolchain install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+
+      - name: Build AMD diagnostics experiment (no game or GPU execution)
+        working-directory: runtime
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --profile diag -p victory --features diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: CLI-only smoke test on GitHub hosted Windows
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\target\diag\victory.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package exact-source diagnostics build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -LiteralPath runtime/target/diag/victory.exe -Destination dist/victory.exe
+          Copy-Item -LiteralPath runtime/README.md -Destination dist/README-upstream.md
+          Copy-Item -LiteralPath runtime/LICENSE -Destination dist/LICENSE
+          $sha = (Get-FileHash dist/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{
+            source = 'https://github.com/avatarmanz/VIctory-7900XTX'
+            source_commit = 'f249fe05458ffaadd4b2a6e479a9cf902a377420'
+            controller_repository = $env:GITHUB_REPOSITORY
+            controller_commit = $env:GITHUB_SHA
+            action_run_id = $env:GITHUB_RUN_ID
+            build_command = 'cargo build --locked --profile diag -p victory --features diagnostics'
+            binary_sha256 = $sha
+            gpu_hardware_tested = $false
+            malware_certified = $false
+            note = 'Experimental independent fork baseline. Not merged into V4; no FPS claims for RX 9070 XT.'
+          } | ConvertTo-Json -Depth 4 | Set-Content dist/source-info.json -Encoding utf8
+          @'
+          EXPERIMENTAL BUILD - NOT YET CLEARED FOR PERSONAL WINDOWS PC
+          Source revision is pinned; built on GitHub-hosted Windows.
+          Do not run on the personal PC until additional safety review and backup.
+          This is a diagnostics comparison from the public AvatarManz fork, NOT a V4 patch.
+          May use more than 32 GB of RAM. No title/game files bundled.
+          CLI: victory.exe --help
+          'Experimental build source: https://github.com/avatarmanz/VIctory-7900XTX'
+          '@ | Set-Content dist/LEIA-ANTES.txt -Encoding utf8
+
+      - name: Upload experimental build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-avatar-7900xt-diagnostics-pinned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
