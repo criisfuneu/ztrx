@@ -4,6 +4,7 @@ run-name: Pinned AvatarManz source diagnostic build
 on:
   push:
     branches: [amd-avatar-benchmark-20261126]
+    paths: ['.github/workflows/amd-avatar-benchmark.yml']
   workflow_dispatch:
   pull_request:
     branches: [main]
