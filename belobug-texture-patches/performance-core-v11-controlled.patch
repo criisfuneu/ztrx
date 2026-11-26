@@ -1,0 +1,226 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2191,11 +2191,21 @@
+ 
+     /// Copies `len` bytes of title memory at `src` into the list's upload
+     /// memory at `dst` when the list is submitted.
+-    pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+-        self.deferred()
+-            .copies
+-            .push(Step::Fill(dst as usize, src as usize, len));
+-    }
++    pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
++        let mut deferred = self.deferred();
++        static JOIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if *JOIN.get_or_init(|| std::env::var_os("VICTORY_V11_FILL_JOIN").is_some_and(|v| v == "1")) {
++            // Only adjacent fills of contiguous title and scratch spans.
++            // Never cross a refresh, write, texture, callback, or list boundary.
++            if let Some(Step::Fill(d, s, n)) = deferred.copies.last_mut() {
++                if let Some(total) = v11_join_fill(*d, *s, *n, dst as usize, src as usize, len) {
++                    *n = total;
++                    return;
++                }
++            }
++        }
++        deferred.copies.push(Step::Fill(dst as usize, src as usize, len));
++    }
+ 
+     /// Brings `[address, address + len)` of a buffer's host copy up to date
+     /// when the list is submitted (once per range until a title copy
+@@ -3003,4 +3013,22 @@
+     }
+ }
+ 
+-/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
++// Exact contiguous fill joining, without changing allocation or queue order.
++fn v11_join_fill(d: usize, s: usize, n: usize, dst: usize, src: usize, len: usize) -> Option<usize> {
++    let total = n.checked_add(len)?;
++    (n > 0 && len > 0 && total <= 128 * 1024
++        && d.checked_add(n) == Some(dst) && s.checked_add(n) == Some(src)
++        && d.checked_add(total).is_some() && s.checked_add(total).is_some()).then_some(total)
++}
++
++#[cfg(test)]
++#[test]
++fn v11_join_fill_is_exact_and_bounded() {
++    assert_eq!(v11_join_fill(100, 200, 16, 116, 216, 16), Some(32));
++    assert_eq!(v11_join_fill(100, 200, 16, 117, 216, 16), None);
++    assert_eq!(v11_join_fill(100, 200, 16, 116, 215, 16), None);
++    assert_eq!(v11_join_fill(100, 200, 131072, 131172, 131272, 1), None);
++    assert_eq!(v11_join_fill(usize::MAX, 200, 1, 0, 201, 1), None);
++}
++
++/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
+@@ -3008,4 +3036,7 @@
+-    const THREADS: usize = 6;
+-    if list.len() <= least {
++    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    let threads_limit = *THREADS.get_or_init(|| {
++        std::env::var("VICTORY_V11_COPY_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(6).clamp(1, 8)
++    });
++    if threads_limit == 1 || list.len() <= least {
+         return f(list);
+     }
+@@ -3011,6 +3042,6 @@
+     }
+     // Small pieces, taken in turn: they are not equally long to do.
+-    let piece = (list.len() / (THREADS * 8)).max(least);
++    let piece = (list.len() / (threads_limit * 8)).max(least);
+     let next = std::sync::atomic::AtomicUsize::new(0);
+     let work = || {
+         loop {
+@@ -3021,7 +3052,7 @@
+             f(&list[from..(from + piece).min(list.len())]);
+         }
+     };
+-    let threads = THREADS.min(list.len().div_ceil(piece));
++    let threads = threads_limit.min(list.len().div_ceil(piece));
+     std::thread::scope(|s| {
+         for _ in 1..threads {
+             s.spawn(work);
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -224,7 +224,35 @@
+ 
+ /// Tables from this many entries on are made once for every length shaders
+ /// read them to.
+-const LARGE: u32 = 64;
++const LARGE: u32 = 64;
++
++// Adapted from the indexed table lookup experiment. Preserve first match.
++fn v11_indexed_tables() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_V11_INDEXED_TABLES").is_some_and(|v| v == "1"))
++}
++
++fn v11_descriptor_index(keys: impl Iterator<Item = u32>) -> Vec<(u32, usize)> {
++    let mut index: Vec<_> = keys.enumerate().map(|(i, key)| (key, i)).collect();
++    index.sort_unstable();
++    index.dedup_by_key(|e| e.0);
++    index
++}
++
++fn v11_descriptor_lookup(index: &[(u32, usize)], key: u32) -> Option<usize> {
++    index.binary_search_by_key(&key, |e| e.0).ok().map(|i| index[i].1)
++}
++
++#[cfg(test)]
++#[test]
++fn v11_descriptor_index_keeps_first_match() {
++    for keys in [vec![], vec![3, 0, 3, 5, 1, 0, 100, 2], vec![u32::MAX, 8, 8]] {
++        let index = v11_descriptor_index(keys.iter().copied());
++        for key in (0..128).chain(std::iter::once(u32::MAX)) {
++            assert_eq!(v11_descriptor_lookup(&index, key), keys.iter().position(|&k| k == key));
++        }
++    }
++}
+ 
+ /// The longest `table` of `heap` was asked for, now for `n` entries.
+ fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
+@@ -1287,11 +1315,17 @@
+             }
+             self.dynamic
+                 .push((std::ptr::from_ref(heap) as usize, first, n));
+-            // The whole range: a shader may index past the entries its
+-            // used-resource list names (descriptor arrays).
+-            for k in 0..n {
+-                let index = first + k;
+-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
++            let by_descriptor = (v11_indexed_tables() && n >= 32 && entries.len() >= 8)
++                .then(|| v11_descriptor_index(entries.iter().map(|u| u.table_offset_dwords / 8)));
++            // The whole range: a shader may index past the entries its
++            // used-resource list names (descriptor arrays).
++            for k in 0..n {
++                let index = first + k;
++                let used = if let Some(by_descriptor) = &by_descriptor {
++                    v11_descriptor_lookup(by_descriptor, k).map(|i| entries[i])
++                } else {
++                    entries.iter().find(|u| u.table_offset_dwords / 8 == k).copied()
++                };
+                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                     Some(View::Constant(address, size)) => {
+                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -91,7 +91,33 @@
+     }
+ }
+ 
+-impl GraphicsState {
++// Backport of upstream eb5061c, credited to the upstream authors.
++// V11 switch leaves the original blend state and cache identity available.
++            BlendState: host_blend(&g.blend, &g.targets),
++fn v11_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if *ON.get_or_init(|| std::env::var_os("VICTORY_V11_INTEGER_BLEND").is_some_and(|v| v == "1")) {
++        host_blend(blend, targets)
++    } else {
++        *blend
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn v11_integer_target_blend_keeps_float_targets() {
++    let mut b = GraphicsState::default().blend;
++    b.RenderTarget[0].BlendEnable = true.into();
++    let mut t = D3D12_RT_FORMAT_ARRAY::default();
++    t.NumRenderTargets = 2;
++    t.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++    t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
++    let result = host_blend(&b, &t);
++    assert!(result.RenderTarget[0].BlendEnable.as_bool());
++    assert!(!result.RenderTarget[1].BlendEnable.as_bool());
++}
++
++impl GraphicsState {
+     /// Takes in one subobject of a stream: its type, then its data at +4
+     /// (+8 for those holding pointers).
+     ///
+@@ -529,7 +555,9 @@
+         let Some(g) = g else {
+             return refuse("graphics state not kept (plain description)", shaders);
+         };
+-        let state = g.describe();
++        let mut state = g.describe();
++        let actual_blend = v11_blend(&g.blend, &g.targets);
++        if actual_blend != g.blend { state.push_str(" v11-integer-blend"); }
+         let depth_with_bounds = g.depth_with_bounds(host);
+         if mesh.is_some() {
+             let name = super::library::name(
+@@ -592,7 +620,7 @@
+                     BytecodeLength: gs.len(),
+                 }
+             }),
+-            BlendState: g.blend,
++            BlendState: actual_blend,
+             SampleMask: g.sample_mask,
+             RasterizerState: g.rasterizer,
+             DepthStencilState: g.depth,
+@@ -721,7 +749,7 @@
+         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+         stages,
+         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
++        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v11_blend(&g.blend, &g.targets)),
+         mask: Sub(
+             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+             g.sample_mask,
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -769,8 +769,9 @@
+             slot: None,
+             skip: 0,
+             written: Default::default(),
+-            twin: Default::default(),
+-            texture: resource.unwrap(),
++            twin: Default::default(),
++            fsr_output: Default::default(),
++            texture: resource.unwrap(),
+             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+             bytes: 0,
+         });
