@@ -170,14 +170,49 @@ diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
 diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
 --- a/crates/victory-gpu/src/pipeline/host.rs
 +++ b/crates/victory-gpu/src/pipeline/host.rs
-@@ -91,7 +91,33 @@
+@@ -91,7 +91,68 @@
      }
  }
  
 -impl GraphicsState {
 +// Backport of upstream eb5061c, credited to the upstream authors.
 +// V11 switch leaves the original blend state and cache identity available.
-+            BlendState: host_blend(&g.blend, &g.targets),
++/// Integer render target formats: D3D12 cannot blend into them.
++fn integer_format(f: DXGI_FORMAT) -> bool {
++    matches!(f,
++        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
++        | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
++        | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
++        | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT
++        | DXGI_FORMAT_R10G10B10A2_UINT
++        | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
++        | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT
++        | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
++        | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT
++        | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
++        | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT)
++}
++
++fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
++    let count = (targets.NumRenderTargets as usize).min(8);
++    let per_target = blend.IndependentBlendEnable.as_bool();
++    let blends = |i: usize| blend.RenderTarget[if per_target { i } else { 0 }].BlendEnable.as_bool();
++    if !(0..count).any(|i| integer_format(targets.RTFormats[i]) && blends(i)) {
++        return *blend;
++    }
++    let mut host = *blend;
++    if !per_target {
++        host.IndependentBlendEnable = true.into();
++        host.RenderTarget = [blend.RenderTarget[0]; 8];
++    }
++    for i in 0..count {
++        if integer_format(targets.RTFormats[i]) {
++            host.RenderTarget[i].BlendEnable = false.into();
++        }
++    }
++    host
++}
++
 +fn v11_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    if *ON.get_or_init(|| std::env::var_os("VICTORY_V11_INTEGER_BLEND").is_some_and(|v| v == "1")) {
@@ -205,7 +240,7 @@ diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pi
      /// Takes in one subobject of a stream: its type, then its data at +4
      /// (+8 for those holding pointers).
      ///
-@@ -529,7 +555,9 @@
+@@ -529,7 +590,9 @@
          let Some(g) = g else {
              return refuse("graphics state not kept (plain description)", shaders);
          };
@@ -216,7 +251,7 @@ diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pi
          let depth_with_bounds = g.depth_with_bounds(host);
          if mesh.is_some() {
              let name = super::library::name(
-@@ -592,7 +620,7 @@
+@@ -592,7 +655,7 @@
                      BytecodeLength: gs.len(),
                  }
              }),
@@ -225,7 +260,7 @@ diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pi
              SampleMask: g.sample_mask,
              RasterizerState: g.rasterizer,
              DepthStencilState: g.depth,
-@@ -721,7 +749,7 @@
+@@ -721,7 +784,7 @@
          root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
          stages,
          ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
