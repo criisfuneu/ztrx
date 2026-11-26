@@ -112,3 +112,15 @@ diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src
  
  fn text(name: *const c_char) -> String {
      if name.is_null() {
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -747,7 +747,8 @@
+             slot: None,
+             skip: 0,
+             written: Default::default(),
+             twin: Default::default(),
++            fsr_output: Default::default(),
+             texture: resource.unwrap(),
+             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+             bytes: 0,
