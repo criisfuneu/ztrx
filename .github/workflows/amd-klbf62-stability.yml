@@ -1,0 +1,88 @@
+name: AMD KLBF 62 Stability R1
+on:
+  push:
+    branches: [amd-klbf62-stability]
+    paths: ['.github/workflows/amd-klbf62-stability.yml', 'klbf62-stability/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout pinned controller
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: control
+          persist-credentials: false
+      - name: Checkout pinned Lab 62
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: PastiiJay/klbf-lab
+          ref: 647ed21f081752c186cbf75187899a2ca322af76
+          path: runtime
+          persist-credentials: false
+      - name: Apply exact checked source edits
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD) -ne '647ed21f081752c186cbf75187899a2ca322af76') { throw 'Unexpected source revision' }
+          python ../control/klbf62-stability/apply.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile and run DirectStorage scheduler tests
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.1 test --locked -p victory-hle --lib snapshot_follows_its_request_across_priority_lanes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.1 test --locked -p victory-hle --lib staging_bounds_compressed_bytes_in_flight
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.1 test --locked -p victory-hle --lib a_page_array_filled_late_is_waited_for
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build release
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          cargo +1.98.1 build --locked --release -p victory
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist/target/release,dist/docs/klbf | Out-Null
+          Copy-Item runtime/target/release/victory.exe dist/target/release/
+          Copy-Item runtime/play.ps1,runtime/README.md,runtime/LICENSE dist/
+          Copy-Item runtime/docs/klbf/skip-amd.txt dist/docs/klbf/
+          Copy-Item control/klbf62-stability/apply.py dist/
+          if (Test-Path runtime/docs/asset-policy.md) { Copy-Item runtime/docs/asset-policy.md dist/docs/ }
+          git -C runtime diff --binary | Set-Content dist/stability.patch -Encoding utf8
+          @'
+          Experimental stability revision R1; pinned Lab 62. Use only with authorized test content in an isolated environment, without credentials or writable host shares. Not a security sandbox.
+          The AMD skip list is retained. No game files or SDK binaries included. Renderer completeness and GPU stability are unverified.
+          Profile: 80% texture room, 80% unreferenced eviction, bounded 256 MiB slot eviction, 8 DirectStorage workers, reduced staging/list pools, normal process priority.
+          DirectStorage snapshots travel with queued requests. Incomplete page arrays return an error. Scratch accounting includes temporary decompression buffers.
+          Fatal exit attempts to terminate only this process after an unhandled access violation has been reported. OS/driver recovery is not guaranteed. KeepCrashReporter restores upstream crash reporting behavior. NoSlotEviction disables slot eviction. RefreshWrites enables extra write notifications experimentally.
+          Do not repeatedly run following a system-wide hang. No shader translator or cache format edits.
+          '@ | Set-Content dist/LEIA-ANTES.txt -Encoding utf8
+          @{
+            upstream = 'PastiiJay/klbf-lab'
+            upstream_commit = '647ed21f081752c186cbf75187899a2ca322af76'
+            control_commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            gpu_tested = $false
+            runtime_executed = $false
+            source_edits = 'apply.py; stability.patch'
+          } | ConvertTo-Json | Set-Content dist/source-info.json -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amd-klbf62-stability-r1-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
