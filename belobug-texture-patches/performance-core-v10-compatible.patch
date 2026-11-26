@@ -1,0 +1,114 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -226,8 +226,39 @@
+ /// read them to.
+ const LARGE: u32 = 64;
+ 
+-/// The longest `table` of `heap` was asked for, now for `n` entries.
+-fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
++// Adapt the indexed descriptor lookup without changing binding semantics.
++// Small tables retain the original linear lookup.
++fn v10_indexed_tables() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_V10_INDEXED_TABLES").is_some_and(|v| v == "1"))
++}
++
++fn v10_descriptor_index(keys: impl Iterator<Item = u32>) -> Vec<(u32, usize)> {
++    let mut index: Vec<_> = keys.enumerate().map(|(i, key)| (key, i)).collect();
++    // Sorting the ordinal as well preserves the original find() result
++    // when declarations refer to the same descriptor.
++    index.sort_unstable();
++    index.dedup_by_key(|entry| entry.0);
++    index
++}
++
++fn v10_descriptor_lookup(index: &[(u32, usize)], key: u32) -> Option<usize> {
++    index.binary_search_by_key(&key, |entry| entry.0).ok().map(|i| index[i].1)
++}
++
++#[cfg(test)]
++#[test]
++fn v10_descriptor_lookup_matches_first_declaration() {
++    for keys in [vec![], vec![3, 0, 3, 5, 1, 0, 100, 2], vec![u32::MAX, 8, 8]] {
++        let indexed = v10_descriptor_index(keys.iter().copied());
++        for key in (0..128).chain(std::iter::once(u32::MAX)) {
++            assert_eq!(v10_descriptor_lookup(&indexed, key), keys.iter().position(|&k| k == key));
++        }
++    }
++}
++
++/// The longest `table` of `heap` was asked for, now for `n` entries.
++fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
+     static LONGEST: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> =
+         std::sync::Mutex::new(None);
+     let mut all = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+@@ -1280,11 +1311,20 @@
+             }
+             self.dynamic
+                 .push((std::ptr::from_ref(heap) as usize, first, n));
+-            // The whole range: a shader may index past the entries its
+-            // used-resource list names (descriptor arrays).
+-            for k in 0..n {
+-                let index = first + k;
+-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
++            // AvatarManz table-plan idea, adapted to this older runtime.
++            // Only index costly rebuilds. Keep the original declaration order
++            // and all resource transitions; the first declaration wins.
++            let descriptor_index = (v10_indexed_tables() && n >= 32 && entries.len() >= 8)
++                .then(|| v10_descriptor_index(entries.iter().map(|u| u.table_offset_dwords / 8)));
++            // The whole range: a shader may index past the entries its
++            // used-resource list names (descriptor arrays).
++            for k in 0..n {
++                let index = first + k;
++                let used = if let Some(by_descriptor) = &descriptor_index {
++                    v10_descriptor_lookup(by_descriptor, k).map(|i| entries[i])
++                } else {
++                    entries.iter().find(|u| u.table_offset_dwords / 8 == k).copied()
++                };
+                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                     Some(View::Constant(address, size)) => {
+                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -217,13 +217,32 @@
+ }
+ 
+ /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
+-extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
+-    tracing::info!(size, "dstorage: staging buffer size");
+-    if let Some(scheduler) = scheduler() {
+-        scheduler.lock().staging = u64::from(size);
+-    }
+-    S_OK
+-}
++extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
++    // AvatarManz / cool_fox staging floor, bounded for 32 GiB hosts.
++    // This changes the scheduler's in-flight byte limit, not a reservation.
++    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    let floor = *FLOOR.get_or_init(|| {
++        v10_staging_floor(std::env::var("VICTORY_DSTORAGE_STAGING_MB").ok().as_deref())
++    });
++    tracing::info!(size, floor, "dstorage: staging buffer size");
++    if let Some(scheduler) = scheduler() {
++        scheduler.lock().staging = u64::from(size).max(floor);
++    }
++    S_OK
++}
++
++fn v10_staging_floor(value: Option<&str>) -> u64 {
++    value.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0).min(256) << 20
++}
++
++#[cfg(test)]
++#[test]
++fn v10_staging_floor_is_opt_in_and_bounded() {
++    assert_eq!(v10_staging_floor(None), 0);
++    assert_eq!(v10_staging_floor(Some("invalid")), 0);
++    assert_eq!(v10_staging_floor(Some("128")), 128 << 20);
++    assert_eq!(v10_staging_floor(Some("18446744073709551615")), 256 << 20);
++}
+ 
+ fn text(name: *const c_char) -> String {
+     if name.is_null() {
