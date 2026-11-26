@@ -1,10 +1,10 @@
 name: AMD AvatarManz experimental diagnostics (isolated)
 
 on:
-  push:
-    branches: [main, amd-avatar-benchmark-20261126]
-    paths: ['.github/workflows/amd-avatar-benchmark.yml']
   workflow_dispatch:
+  workflow_run:
+    workflows: [AMD Performance V9 Final AVX2]
+    types: [completed]
 
 permissions:
   contents: read
@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   build:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.id == 45695016193 }}
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
