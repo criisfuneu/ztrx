@@ -1,0 +1,88 @@
+name: AMD Current Base - KLBF Lab 61 and 62
+on:
+  push:
+    branches: [amd-current-klbf-lab]
+    paths: ['.github/workflows/amd-current-klbf-lab.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lab: '61'
+            upstream: '66332e8d702ae913a3cd59e8ff49065737437845'
+            validation: 'Upstream reports 14 FPS average over 37 minutes on RX 9070 XT, Ryzen 9800X3D, 32 GB. Not independently reproduced.'
+          - lab: '62'
+            upstream: '647ed21f081752c186cbf75187899a2ca322af76'
+            validation: 'Newest beta-2 revision as checked on 2026-11-26; Lab 62 performance not yet established in upstream README.'
+    steps:
+      - name: Checkout pinned upstream source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: PastiiJay/klbf-lab
+          ref: ${{ matrix.upstream }}
+          path: runtime
+          persist-credentials: false
+      - name: Verify source and build upstream release
+        shell: pwsh
+        working-directory: runtime
+        env:
+          EXPECTED_REVISION: ${{ matrix.upstream }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD) -ne $env:EXPECTED_REVISION) { throw 'Unexpected source revision' }
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.1 build --locked --release -p victory
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package exact upstream baseline
+        shell: pwsh
+        env:
+          LAB: ${{ matrix.lab }}
+          UPSTREAM_SHA: ${{ matrix.upstream }}
+          UPSTREAM_VALIDATION: ${{ matrix.validation }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist/target/release,dist/docs/klbf | Out-Null
+          Copy-Item runtime/target/release/victory.exe dist/target/release/
+          Copy-Item runtime/play.ps1,runtime/README.md,runtime/LICENSE dist/
+          Copy-Item runtime/docs/klbf/skip-amd.txt dist/docs/klbf/
+          foreach ($file in @('CHANGELOG.md','victory.example.toml','docs/GUIDE.md','docs/asset-policy.md','docs/klbf/MEASUREMENT.md','docs/klbf/results.md')) {
+              if (Test-Path "runtime/$file" -PathType Leaf) { Copy-Item "runtime/$file" "dist/$file" }
+          }
+          $manifest = [ordered]@{
+            upstream = 'PastiiJay/klbf-lab'
+            lab = $env:LAB
+            commit = $env:UPSTREAM_SHA
+            source = "https://github.com/PastiiJay/klbf-lab/tree/$env:UPSTREAM_SHA"
+            build = 'Locked upstream release profile, Rust 1.98.1, no local runtime patches'
+            launcher = 'Original upstream play.ps1 and skip-amd.txt retained unchanged'
+            control_commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            sha256 = (Get-FileHash dist/target/release/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            gpu_tested = $false
+            binary_executed_in_ci = $false
+            validation = $env:UPSTREAM_VALIDATION
+            security_review = 'Partial only; host filesystem access remains; not a sandbox.'
+            licensing = 'Upstream GPL-3.0; see upstream asset-policy for the format-table license exception.'
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content dist/source-info.json -Encoding utf8
+          @'
+          EXPERIMENTAL UPSTREAM BASELINE.
+          Use only with legally obtained, authorized test content in an isolated environment without personal data, credentials or writable host shares.
+          No game files or SDK DLLs are packaged. Static review is partial; the runtime is not a security sandbox.
+          The original upstream launcher and AMD pipeline skip list are unchanged. The optional prebuild may retry after driver crashes; review it before use. Do not retry repeatedly after system-level hangs or device loss.
+          Use separately obtained official AMD FidelityFX SDK signed binaries. No V9-V13 patches, forced async overrides, or frame generation overrides were added.
+          See source-info.json for the exact upstream revision and reported results. CI only compiles and packages; performance and GPU stability are not established on your PC.
+          '@ | Set-Content dist/LEIA-ANTES.txt -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amd-current-klbf-lab-${{ matrix.lab }}-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
