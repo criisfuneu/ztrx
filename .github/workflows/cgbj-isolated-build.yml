@@ -1,0 +1,68 @@
+name: CGBJ isolated experimental build
+on:
+  push:
+    branches: [cgbj-isolated-audit-build]
+    paths: ['.github/workflows/cgbj-isolated-build.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cgbj-isolated-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout pinned public mirror
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: DoubleGhosty/cool_fox
+          ref: f4b48ad766ddbec1a1867022cd42f7645b0dd55e
+          path: runtime
+          persist-credentials: false
+      - name: Verify source and build only
+        shell: pwsh
+        working-directory: runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = (git rev-parse HEAD).Trim()
+          if ($sha -ne 'f4b48ad766ddbec1a1867022cd42f7645b0dd55e') { throw 'Unexpected revision' }
+          rustup toolchain install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --profile diag -p victory --features diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package without executing the binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item runtime/target/diag/victory.exe,runtime/README.md,runtime/LICENSE dist/
+          [ordered]@{
+            source = 'https://github.com/DoubleGhosty/cool_fox'
+            source_commit = 'f4b48ad766ddbec1a1867022cd42f7645b0dd55e'
+            controller_commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            binary_sha256 = (Get-FileHash dist/victory.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            profile = 'diag, diagnostics'
+            security_review = 'Partial static review only; mirror authenticity unverified'
+            executable_run_in_ci = $false
+            gpu_tested = $false
+          } | ConvertTo-Json | Set-Content dist/source-info.json -Encoding utf8
+          @'
+          UNTRUSTED EXPERIMENTAL BUILD. PARTIAL STATIC REVIEW ONLY.
+          No game files included. Not validated on GPU.
+          Build on a disposable hosted runner; no runtime execution in CI.
+          Test only in an isolated environment, without personal files,
+          credentials, shared writable host folders or network access.
+          Do not interpret the SHA-256 hash as a malware certification.
+          The original upstream is unavailable; mirror authenticity is unverified.
+          V9 AVX2 is unchanged.
+          '@ | Set-Content dist/LEIA-ANTES.txt -Encoding utf8
+      - name: Upload isolated build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cgbj-cool-fox-f4b48ad-isolated-DIAG
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
