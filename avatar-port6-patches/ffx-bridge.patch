@@ -1,0 +1,1265 @@
+diff --git a/crates/victory-gpu/src/ffx.rs b/crates/victory-gpu/src/ffx.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/victory-gpu/src/ffx.rs
+@@ -0,0 +1,559 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Adapted from PastiiJay/klbf-lab 7b698b9652e88ecabd823f0dd9138dd9c40dd7bd; original PC FSR work credited to upstream contributors (AwkGrep256 and collaborators). V8.1 adds FP16 output and GPU RGB9E5 conversion.
++//! The title's FidelityFX upscaler calls answered by AMD's PC FidelityFX
++//! loader for D3D12, `amd_fidelityfx_loader_dx12.dll` from the public
++//! FidelityFX SDK (2.x, `Kits/FidelityFX/signedbin`), in the folder
++//! `VICTORY_FFX_DIR` names.
++//!
++//! The console's FidelityFX API has the PC API's structure layouts. Its
++//! upscaler DLL only carries the fixed 1920x1080 Quality tables: a Series X
++//! configuration made to pick it (3840x2160 output) gets "maxUpscaleSize
++//! must be 1920x1080" and the title stops. Here the title's descriptions go
++//! to the PC loader with the console objects swapped for the host's: the
++//! console backend description for the DX12 one on the host device, the
++//! command list for the host list behind the title's, and every texture for
++//! its host copy, moved to the state the upscaler reads (inputs) or writes
++//! (output) on entry. The PC upscaler leaves them in those states.
++#![allow(non_snake_case)]
++#![allow(clippy::not_unsafe_ptr_arg_deref)]
++
++use std::ffi::c_void;
++use std::sync::OnceLock;
++
++use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32};
++use windows::core::{Interface, PCSTR, PCWSTR};
++
++use crate::object::This;
++
++pub(crate) mod rgb9e5;
++
++
++type ReturnCode = u32;
++const OK: ReturnCode = 0;
++const ERROR: ReturnCode = 1;
++const ERROR_PARAMETER: ReturnCode = 6;
++
++/// `ffxApiHeader`: a description's type and the next in its chain.
++#[repr(C)]
++pub struct Header {
++    kind: u64,
++    next: *mut Header,
++}
++
++const CREATE_UPSCALE: u64 = 0x0001_0000;
++const DISPATCH_UPSCALE: u64 = 0x0001_0001;
++const QUERY_GET_VERSIONS: u64 = 4;
++const QUERY_JITTER_PHASE_COUNT: u64 = 0x0001_0004;
++/// The console's backend description; the device is at +0x10, as in the
++/// PC's DX12 one.
++const CONSOLE_BACKEND: u64 = 0x0100_0002;
++const BACKEND_DX12: u64 = 2;
++
++/// `ffxCreateBackendDX12Desc`.
++#[repr(C)]
++struct BackendDx12 {
++    header: Header,
++    device: *mut c_void,
++}
++
++/// `ffxCreateContextDescUpscale`.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct CreateUpscale {
++    kind: u64,
++    next: *mut Header,
++    flags: u32,
++    max_render: [u32; 2],
++    max_upscale: [u32; 2],
++    message: *const c_void,
++}
++const _: () = assert!(size_of::<CreateUpscale>() == 48);
++
++/// `FfxApiResource`: the resource, its description, its state.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct Resource {
++    resource: *mut c_void,
++    description: [u32; 8],
++    state: u32,
++}
++const _: () = assert!(size_of::<Resource>() == 48);
++
++/// `ffxDispatchDescUpscale`.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct DispatchUpscale {
++    kind: u64,
++    next: *mut Header,
++    command_list: *mut c_void,
++    /// Color, depth, motion vectors, exposure, reactive, transparency and
++    /// composition, output.
++    resources: [Resource; 7],
++    jitter: [f32; 2],
++    motion_vector_scale: [f32; 2],
++    render_size: [u32; 2],
++    upscale_size: [u32; 2],
++    sharpening: bool,
++    sharpness: f32,
++    frame_time_delta: f32,
++    pre_exposure: f32,
++    reset: bool,
++    camera: [f32; 4],
++    flags: u32,
++}
++const _: () = assert!(size_of::<DispatchUpscale>() == 432);
++const OUTPUT: usize = 6;
++
++/// `ffxQueryDescGetVersions`.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct GetVersions {
++    kind: u64,
++    next: *mut Header,
++    create_kind: u64,
++    device: *mut c_void,
++    count: *mut u64,
++    ids: *mut u64,
++    names: *mut *const i8,
++}
++
++/// FfxApiResourceState bits and the host states they stand for.
++const FFX_UNORDERED_ACCESS: u32 = 1 << 1;
++const FFX_COMPUTE_READ: u32 = 1 << 2;
++const HOST_UNORDERED_ACCESS: u32 = 0x8;
++const HOST_NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
++
++type Farproc = unsafe extern "system" fn() -> isize;
++type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> ReturnCode;
++type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> ReturnCode;
++type Configure = unsafe extern "C" fn(*mut *mut c_void, *const Header) -> ReturnCode;
++type Query = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> ReturnCode;
++type Dispatch = unsafe extern "C" fn(*mut *mut c_void, *const Header) -> ReturnCode;
++
++struct Api {
++    create: Create,
++    destroy: Destroy,
++    configure: Configure,
++    query: Query,
++    dispatch: Dispatch,
++}
++
++/// Opt in only when the user points to an installed PC SDK.
++pub fn enabled() -> bool {
++    std::env::var_os("VICTORY_FFX_DIR").is_some()
++}
++
++/// AMD's loader, loaded on first use. The upscaler it picks is loaded by
++/// full path first, so the loader finds it without a change to the DLL
++/// search path.
++fn api() -> Option<&'static Api> {
++    static API: OnceLock<Option<Api>> = OnceLock::new();
++    API.get_or_init(|| {
++        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_FFX_DIR")?);
++        if !dir.is_absolute() { tracing::error!("ffx: SDK directory must be absolute"); return None; }
++        let dir = dir.canonicalize().ok()?;
++        let load = |name: &str| {
++            let path: Vec<u16> = dir.join(name).as_os_str().encode_wide_nul();
++            // SAFETY: a nul-terminated path.
++            unsafe { LoadLibraryExW(PCWSTR(path.as_ptr()), None, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) }.ok()
++        };
++        if load("amd_fidelityfx_upscaler_dx12.dll").is_none() {
++            tracing::error!(?dir, "ffx: PC SDK upscaler could not be loaded");
++            return None;
++        }
++        let Some(loader) = load("amd_fidelityfx_loader_dx12.dll") else {
++            tracing::error!(?dir, "ffx: amd_fidelityfx_loader_dx12.dll not found; set VICTORY_FFX_DIR to the SDK's signedbin");
++            return None;
++        };
++        let get = |name: &[u8]| {
++            // SAFETY: a loaded module and a nul-terminated name.
++            unsafe { GetProcAddress(loader, PCSTR(name.as_ptr())) }
++        };
++        // SAFETY: the SDK's exports, of these types (`ffx_api.h`).
++        unsafe {
++            Some(Api {
++                create: std::mem::transmute::<Farproc, Create>(get(b"ffxCreateContext\0")?),
++                destroy: std::mem::transmute::<Farproc, Destroy>(get(b"ffxDestroyContext\0")?),
++                configure: std::mem::transmute::<Farproc, Configure>(get(b"ffxConfigure\0")?),
++                query: std::mem::transmute::<Farproc, Query>(get(b"ffxQuery\0")?),
++                dispatch: std::mem::transmute::<Farproc, Dispatch>(get(b"ffxDispatch\0")?),
++            })
++        }
++    })
++    .as_ref()
++}
++
++trait WideNul {
++    fn encode_wide_nul(&self) -> Vec<u16>;
++}
++
++impl WideNul for std::ffi::OsStr {
++    fn encode_wide_nul(&self) -> Vec<u16> {
++        use std::os::windows::ffi::OsStrExt;
++        self.encode_wide().chain(Some(0)).collect()
++    }
++}
++
++fn host_device() -> Option<*mut c_void> {
++    crate::host::host().map(|h| h.device.as_raw())
++}
++
++/// Logs a description type the first time it is seen.
++fn note(call: &str, kind: u64) {
++    static SEEN: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
++    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    if !seen.iter().any(|(c, k)| c == call && *k == kind) {
++        seen.push((call.to_owned(), kind));
++        tracing::info!("ffx: {call} with description type {kind:#x}");
++    }
++}
++
++/// The upscale description in a chain that also holds the console backend
++/// description, the one this module stands in for.
++///
++/// # Safety
++///
++/// `h` is null or the start of a chain of valid descriptions.
++unsafe fn upscale_in(mut h: *const Header) -> Option<CreateUpscale> {
++    let (mut upscale, mut backend) = (None, false);
++    while !h.is_null() {
++        // SAFETY: the caller's chain.
++        let kind = unsafe { (*h).kind };
++        match kind {
++            // SAFETY: a description of this type.
++            CREATE_UPSCALE => upscale = Some(unsafe { *h.cast::<CreateUpscale>() }),
++            CONSOLE_BACKEND => backend = true,
++            _ => note("ffxCreateContext", kind),
++        }
++        // SAFETY: as above.
++        h = unsafe { (*h).next };
++    }
++    upscale.filter(|_| backend)
++}
++
++pub extern "C" fn ffxCreateContext(
++    context: *mut *mut c_void,
++    desc: *mut Header,
++    _memory: *const c_void,
++) -> ReturnCode {
++    let (Some(api), Some(device)) = (api(), host_device()) else {
++        return ERROR;
++    };
++    if context.is_null() || desc.is_null() {
++        return ERROR_PARAMETER;
++    }
++    // SAFETY: the title's chain of descriptions.
++    let Some(mut upscale) = (unsafe { upscale_in(desc) }) else {
++        return ERROR_PARAMETER;
++    };
++    // The console's version and provider descriptions name console builds;
++    // the PC loader picks the newest upscaler the GPU runs.
++    let mut dx12 = BackendDx12 {
++        header: Header {
++            kind: BACKEND_DX12,
++            next: std::ptr::null_mut(),
++        },
++        device,
++    };
++    upscale.next = (&raw mut dx12).cast();
++    // SAFETY: the SDK's call with a chain that outlives it.
++    let r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
++    let provider = provider_name(context);
++    tracing::info!(
++        render = ?upscale.max_render, upscale = ?upscale.max_upscale, flags = upscale.flags, result = r, provider,
++        "ffx: upscale context on the host GPU"
++    );
++    r
++}
++
++/// The upscaler version the loader chose for a context, for the log.
++fn provider_name(context: *mut *mut c_void) -> String {
++    #[repr(C)]
++    struct ProviderVersion {
++        kind: u64,
++        next: *mut Header,
++        id: u64,
++        name: *const i8,
++    }
++    let Some(api) = api() else {
++        return String::new();
++    };
++    let mut q = ProviderVersion {
++        kind: 6,
++        next: std::ptr::null_mut(),
++        id: 0,
++        name: std::ptr::null(),
++    };
++    // SAFETY: the context pointer the title passed, checked for null.
++    if context.is_null() || unsafe { (*context).is_null() } {
++        return String::new();
++    }
++    // SAFETY: a context the loader created.
++    if unsafe { (api.query)(context, (&raw mut q).cast()) } != OK || q.name.is_null() {
++        return String::new();
++    }
++    // SAFETY: the loader's nul-terminated name.
++    unsafe { std::ffi::CStr::from_ptr(q.name) }
++        .to_string_lossy()
++        .into_owned()
++}
++
++pub extern "C" fn ffxDestroyContext(
++    context: *mut *mut c_void,
++    _memory: *const c_void,
++) -> ReturnCode {
++    let Some(api) = api() else { return ERROR };
++    // SAFETY: a context this module created.
++    unsafe { (api.destroy)(context, std::ptr::null()) }
++}
++
++pub extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
++    let Some(api) = api() else { return ERROR };
++    if !desc.is_null() {
++        // SAFETY: the title's description.
++        note("ffxConfigure", unsafe { (*desc).kind });
++    }
++    // SAFETY: passed on as the title made it.
++    unsafe { (api.configure)(context, desc) }
++}
++
++pub extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> ReturnCode {
++    let (Some(api), Some(device)) = (api(), host_device()) else {
++        return ERROR;
++    };
++    if desc.is_null() {
++        return ERROR_PARAMETER;
++    }
++    // SAFETY: the title's description.
++    let kind = unsafe { (*desc).kind };
++    note("ffxQuery", kind);
++    if kind == QUERY_GET_VERSIONS {
++        // It names the device to enumerate for: the host's.
++        // SAFETY: a description of this type.
++        let mut q = unsafe { *desc.cast::<GetVersions>() };
++        q.device = device;
++        // SAFETY: the SDK's call; the title's output arrays stay its own.
++        return unsafe { (api.query)(context, (&raw mut q).cast()) };
++    }
++    // SAFETY: a null context pointer or one this module filled.
++    let contextless = context.is_null() || unsafe { (*context).is_null() };
++    if !contextless {
++        // SAFETY: passed on with the PC context.
++        let r = unsafe { (api.query)(context, desc) };
++        log_query(kind, desc, r);
++        return r;
++    }
++    // Without a context the loader learns the backend from the chain: the
++    // DX12 one is added at its end for the call, then taken off.
++    let mut dx12 = BackendDx12 {
++        header: Header {
++            kind: BACKEND_DX12,
++            next: std::ptr::null_mut(),
++        },
++        device,
++    };
++    let mut last = desc;
++    // SAFETY: the title's chain.
++    while !unsafe { (*last).next }.is_null() {
++        // SAFETY: as above.
++        last = unsafe { (*last).next };
++    }
++    // SAFETY: the chain's end, restored before returning.
++    unsafe { (*last).next = (&raw mut dx12).cast() };
++    // SAFETY: the title's description with the backend chained for the call.
++    let r = unsafe { (api.query)(context, desc) };
++    // SAFETY: the chain's end again, as the title made it.
++    unsafe { (*last).next = std::ptr::null_mut() };
++    log_query(kind, desc, r);
++    r
++}
++
++/// A query's result, once per type, with the jitter phase count it gave.
++fn log_query(kind: u64, desc: *mut Header, r: ReturnCode) {
++    static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
++    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    if seen.contains(&kind) {
++        return;
++    }
++    seen.push(kind);
++    #[repr(C)]
++    struct JitterPhaseCount {
++        kind: u64,
++        next: *mut Header,
++        render_width: u32,
++        display_width: u32,
++        out: *mut i32,
++    }
++    if kind == QUERY_JITTER_PHASE_COUNT {
++        // SAFETY: a description of this type.
++        let q = unsafe { &*desc.cast::<JitterPhaseCount>() };
++        // SAFETY: the title's output, written by the call when it succeeded.
++        let count = (r == OK && !q.out.is_null()).then(|| unsafe { *q.out });
++        tracing::info!(
++            r,
++            q.render_width,
++            q.display_width,
++            ?count,
++            "ffx: jitter phase count"
++        );
++    } else {
++        tracing::info!(r, "ffx: query {kind:#x}");
++    }
++}
++
++pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
++    let Some(api) = api() else { return ERROR };
++    if context.is_null() || desc.is_null() {
++        return ERROR_PARAMETER;
++    }
++    // SAFETY: the caller supplies the documented description.
++    if unsafe { (*desc).kind } != DISPATCH_UPSCALE {
++        return ERROR_PARAMETER;
++    }
++    let mut d = unsafe { *desc.cast::<DispatchUpscale>() };
++    let title_list = d.command_list as This;
++    let Some(list) = crate::list::host_list(title_list) else {
++        tracing::error!("ffx: no native command list for dispatch");
++        return ERROR_PARAMETER;
++    };
++    let input = d.resources[0].resource as This;
++    let output = d.resources[OUTPUT].resource as This;
++    if input.is_null() || output.is_null() || input == output || d.render_size.contains(&0) || d.upscale_size.contains(&0) {
++        return ERROR_PARAMETER;
++    }
++    // The native SDK writes FP16 on adapters without a typed RGB9E5 UAV.
++    // Cache scratch alongside the destination host resource.
++    let Some(output_host) = crate::resource::host_copy(output) else { return ERROR_PARAMETER };
++    let destination = &output_host.texture;
++    let td = unsafe { destination.GetDesc() };
++    let packed = if td.Format.0 == 67 {
++        let Some(p) = output_host.fsr_output.get_or_init(|| rgb9e5::Output::new(destination)).as_ref() else {
++            return ERROR_PARAMETER;
++        };
++        if !p.matches(d.upscale_size) { return ERROR_PARAMETER; }
++        Some(p)
++    } else {
++        None
++    };
++    // Validate all required resources before recording transitions.
++    for (i, r) in d.resources.iter().enumerate() {
++        if r.resource.is_null() {
++            if i == 0 || i == 1 || i == 2 || i == OUTPUT { return ERROR_PARAMETER; }
++            continue;
++        }
++        let title = r.resource as This;
++        let Some(texture) = crate::resource::host_resource(title) else {
++            missing_texture(i, title);
++            return ERROR_PARAMETER;
++        };
++        if i == OUTPUT && packed.is_some() { continue; }
++        let wanted = if i == OUTPUT { HOST_UNORDERED_ACCESS } else { HOST_NON_PIXEL_SHADER_RESOURCE };
++        let td = unsafe { texture.GetDesc() };
++        if crate::host::legal_state(texture, wanted) != wanted
++            || (r.description[1] == 29 && td.Format.0 != 67 && td.Format.0 != 10)
++            || (i == OUTPUT && td.Format.0 == 67)
++            || (i == OUTPUT && (td.Width < u64::from(d.upscale_size[0]) || td.Height < d.upscale_size[1]))
++            || (i == 0 && (td.Width < u64::from(d.render_size[0]) || td.Height < d.render_size[1]))
++        {
++            static TOLD: std::sync::Once = std::sync::Once::new();
++            TOLD.call_once(|| tracing::warn!(slot = i, format = td.Format.0, wanted, "V8 FSR incompatible host resource; no dispatch recorded"));
++            return ERROR_PARAMETER;
++        }
++    }
++    // Use the fork\'s tile-aware write tracking and ordinary list state transitions.
++    crate::texture::card_writes(list, output, destination, None);
++    for (i, r) in d.resources.iter_mut().enumerate() {
++        if i == OUTPUT && let Some(p) = packed {
++            *r = p.sdk_resource(list);
++            continue;
++        }
++        if r.resource.is_null() { continue; }
++        let title = r.resource as This;
++        let Some(texture) = crate::resource::host_resource(title) else { return ERROR_PARAMETER };
++        let (wanted, ffx) = if i == OUTPUT {
++            (HOST_UNORDERED_ACCESS, FFX_UNORDERED_ACCESS)
++        } else {
++            (HOST_NON_PIXEL_SHADER_RESOURCE, FFX_COMPUTE_READ)
++        };
++        if i != OUTPUT && crate::texture::title_written(texture) {
++            crate::texture::upload(list, title, texture);
++        }
++        crate::list::ensure_state(list, title, wanted);
++        if r.description[1] == 29 && unsafe { texture.GetDesc() }.Format.0 == 10 {
++            r.description[1] = 4;
++        }
++        list.keep(texture);
++        r.resource = texture.as_raw();
++        r.state = ffx;
++    }
++    d.command_list = list.list.as_raw();
++    // Dereferencing Rec flushes any held barriers before the external SDK records.
++    let result = unsafe { (api.dispatch)(context, (&raw const d).cast()) };
++    if result == OK {
++        if let Some(p) = packed {
++            p.copy_to(list, output, destination);
++            // Mark the logical shader write for alias selection. The real
++            // destination state is COPY_DEST, tracked by ensure_state.
++            // The copy destination transition is tracked by the fork\'s HostList.
++            static PACKED: std::sync::Once = std::sync::Once::new();
++            PACKED.call_once(|| tracing::info!(size = ?d.upscale_size, "V8.1 FSR RGB9E5 conversion recorded"));
++        }
++        crate::texture::host_written(output);
++    }
++    crate::list::forget_host_bindings(title_list);
++    static FIRST: std::sync::Once = std::sync::Once::new();
++    FIRST.call_once(|| tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, result, packed = packed.is_some(), "V8.1 FSR host dispatch"));
++    result
++}
++
++fn missing_texture(slot: usize, title: This) {
++    use std::sync::atomic::{AtomicU8, Ordering};
++    static REPORTED: AtomicU8 = AtomicU8::new(0);
++    let bit = 1 << slot;
++    if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
++        let (title_address, desc) = crate::resource::texture_memory(title)
++            .map_or((0, None), |(address, desc)| (address as usize, Some(desc)));
++        tracing::warn!(slot, ?title, title_address, ?desc, "ffx: an upscale resource without a host texture");
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn create_takes_the_upscale_description_only_beside_the_console_backend() {
++        let mut backend = Header {
++            kind: CONSOLE_BACKEND,
++            next: std::ptr::null_mut(),
++        };
++        let backend = &raw mut backend;
++        // The version description the title chains in between.
++        let mut version = Header {
++            kind: 0x1_000b,
++            next: backend,
++        };
++        let upscale = CreateUpscale {
++            kind: CREATE_UPSCALE,
++            next: &raw mut version,
++            flags: 41,
++            max_render: [2560, 1440],
++            max_upscale: [3840, 2160],
++            message: std::ptr::null(),
++        };
++        let chain = (&raw const upscale).cast::<Header>();
++        // SAFETY: a chain of our own descriptions, alive for the calls.
++        let found = unsafe { upscale_in(chain) }.expect("the upscale description");
++        assert_eq!(
++            (found.flags, found.max_render, found.max_upscale),
++            (41, [2560, 1440], [3840, 2160])
++        );
++        // A PC backend is someone else's chain: not ours to answer.
++        // SAFETY: our own description, still alive.
++        unsafe { (*backend).kind = BACKEND_DX12 };
++        // SAFETY: as above.
++        assert!(unsafe { upscale_in(chain) }.is_none());
++        // SAFETY: an empty chain.
++        assert!(unsafe { upscale_in(std::ptr::null()) }.is_none());
++    }
++}
+diff --git a/crates/victory-hle/src/modules/ffx.rs b/crates/victory-hle/src/modules/ffx.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/victory-hle/src/modules/ffx.rs
+@@ -0,0 +1,31 @@
++//! `amd_fidelityfx_loader_xbox.dll` and `amd_fidelityfx_upscaler_xbox.dll`,
++//! which both export the five FidelityFX calls: with `VICTORY_FFX_DIR` set,
++//! served by AMD's PC upscaler on the host GPU (`victory_gpu::ffx`) instead
++//! of the console DLLs, whose tables only cover a 1920x1080 output.
++
++use crate::{HleExport, HleModule};
++
++pub(crate) fn module() -> HleModule {
++    use victory_gpu::ffx;
++    let export = |name, address: usize| HleExport { name, address };
++    HleModule {
++        name: "ffx",
++        dlls: &[
++            "amd_fidelityfx_loader_xbox.dll",
++            "amd_fidelityfx_upscaler_xbox.dll",
++        ],
++        exports: vec![
++            export(
++                "ffxCreateContext",
++                ffx::ffxCreateContext as *const () as usize,
++            ),
++            export(
++                "ffxDestroyContext",
++                ffx::ffxDestroyContext as *const () as usize,
++            ),
++            export("ffxConfigure", ffx::ffxConfigure as *const () as usize),
++            export("ffxQuery", ffx::ffxQuery as *const () as usize),
++            export("ffxDispatch", ffx::ffxDispatch as *const () as usize),
++        ],
++    }
++}
+diff --git a/crates/victory-gpu/src/ffx/rgb9e5.rs b/crates/victory-gpu/src/ffx/rgb9e5.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/victory-gpu/src/ffx/rgb9e5.rs
+@@ -0,0 +1,501 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Adapted from PastiiJay/klbf-lab 7b698b9652e88ecabd823f0dd9138dd9c40dd7bd; upstream contributors credited.
++//! Writes FidelityFX's FP16 output to the title's RGB9E5 texture on hosts
++//! that can sample RGB9E5 but cannot write it through a typed UAV.
++
++use std::sync::OnceLock;
++
++use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
++use windows::Win32::Graphics::Direct3D::ID3DBlob;
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::Common::*;
++use windows::core::{Error, Interface, Result, s};
++
++use crate::host::{HostList, host, transition};
++use crate::object::This;
++
++use super::{FFX_UNORDERED_ACCESS, Resource};
++
++const SOURCE: &str = r#"
++#define RS "DescriptorTable(SRV(t0)), UAV(u0), RootConstants(num32BitConstants=3, b0)"
++Texture2D<float4> color : register(t0);
++RWByteAddressBuffer packed : register(u0);
++cbuffer Extent : register(b0) { uint width; uint height; uint pitch; }
++
++// RGB9E5 stores three unsigned 9-bit mantissas and one shared 5-bit exponent.
++uint pack_rgb9e5(float3 rgb) {
++    rgb = clamp(rgb, 0.0, 65408.0);
++    float largest = max(rgb.r, max(rgb.g, rgb.b));
++    uint exponent = ((asuint(max(largest, exp2(-16.0))) >> 23) & 255u) - 111u;
++    float scale = exp2(24.0 - float(exponent));
++    if (floor(largest * scale + 0.5) >= 512.0) {
++        exponent++;
++        scale *= 0.5;
++    }
++    uint3 mantissa = uint3(floor(rgb * scale + 0.5));
++    return mantissa.r | (mantissa.g << 9) | (mantissa.b << 18) | (exponent << 27);
++}
++
++[RootSignature(RS)]
++[numthreads(8, 8, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++    if (id.x >= width || id.y >= height) return;
++    packed.Store(id.y * pitch + id.x * 4, pack_rgb9e5(color.Load(int3(id.xy, 0)).rgb));
++}
++"#;
++
++struct Packer {
++    root: ID3D12RootSignature,
++    pipeline: ID3D12PipelineState,
++}
++
++// SAFETY: the immutable D3D12 root signature and pipeline are free-threaded.
++unsafe impl Send for Packer {}
++// SAFETY: as above.
++unsafe impl Sync for Packer {}
++
++fn packer() -> Option<&'static Packer> {
++    static PACKER: OnceLock<Option<Packer>> = OnceLock::new();
++    PACKER
++        .get_or_init(|| match make_packer() {
++            Ok(packer) => Some(packer),
++            Err(error) => {
++                tracing::warn!(%error, "ffx: could not create RGB9E5 pack pipeline");
++                None
++            }
++        })
++        .as_ref()
++}
++
++fn make_packer() -> Result<Packer> {
++    let device = &host().ok_or_else(Error::empty)?.device;
++    let mut code: Option<ID3DBlob> = None;
++    let mut errors: Option<ID3DBlob> = None;
++    // SAFETY: the source and names live for the call and the out pointers are ours.
++    let result = unsafe {
++        D3DCompile(
++            SOURCE.as_ptr().cast(),
++            SOURCE.len(),
++            s!("ffx-rgb9e5"),
++            None,
++            None,
++            s!("main"),
++            s!("cs_5_1"),
++            0,
++            0,
++            &mut code,
++            Some(&mut errors),
++        )
++    };
++    if let Err(error) = result {
++        if let Some(errors) = errors {
++            // SAFETY: the compiler blob owns its bytes.
++            let text = unsafe {
++                std::slice::from_raw_parts(errors.GetBufferPointer().cast(), errors.GetBufferSize())
++            };
++            tracing::warn!(message = %String::from_utf8_lossy(text), "ffx: RGB9E5 shader compilation failed");
++        }
++        return Err(error);
++    }
++    let code = code.ok_or_else(Error::empty)?;
++    // SAFETY: the compiler blob contains the shader and its root signature.
++    unsafe {
++        let bytes =
++            std::slice::from_raw_parts(code.GetBufferPointer().cast(), code.GetBufferSize());
++        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
++        let pipeline = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++            pRootSignature: std::mem::transmute_copy(&root),
++            CS: D3D12_SHADER_BYTECODE {
++                pShaderBytecode: bytes.as_ptr().cast(),
++                BytecodeLength: bytes.len(),
++            },
++            ..Default::default()
++        })?;
++        Ok(Packer { root, pipeline })
++    }
++}
++
++/// One pair of scratch resources per title output. All lists execute on the
++/// host's direct queue, and each use restores the scratch states, so lists
++/// can share the pair even if they were recorded in a different order.
++pub(crate) struct Output {
++    float: ID3D12Resource,
++    packed: ID3D12Resource,
++    srv: ID3D12DescriptorHeap,
++    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++    packer: &'static Packer,
++}
++
++impl Output {
++    pub(crate) fn new(destination: &ID3D12Resource) -> Option<Self> {
++        match Self::allocate(destination, packer()?) {
++            Ok(output) => Some(output),
++            Err(error) => {
++                static REPORTED: std::sync::Once = std::sync::Once::new();
++                REPORTED
++                    .call_once(|| tracing::warn!(%error, "ffx: RGB9E5 scratch allocation failed"));
++                None
++            }
++        }
++    }
++
++    fn allocate(destination: &ID3D12Resource, packer: &'static Packer) -> Result<Self> {
++        let device = &host().ok_or_else(Error::empty)?.device;
++        // SAFETY: a live 2D texture. The footprint and size cover its sole subresource.
++        unsafe {
++            let desc = destination.GetDesc();
++            if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
++                || desc.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP
++                || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
++                || desc.SampleDesc.Count != 1 || desc.Width == 0 || desc.Height == 0
++                || desc.Width > 16384 || desc.Height > 16384
++            {
++                return Err(Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
++            }
++            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
++            let mut size = 0;
++            device.GetCopyableFootprints(
++                &desc,
++                0,
++                1,
++                0,
++                Some(&mut footprint),
++                None,
++                None,
++                Some(&mut size),
++            );
++            if size == u64::MAX || size > u64::from(u32::MAX) || footprint.Footprint.RowPitch == 0 {
++                return Err(Error::from_hresult(
++                    windows::Win32::Foundation::E_INVALIDARG,
++                ));
++            }
++            let heap = D3D12_HEAP_PROPERTIES {
++                Type: D3D12_HEAP_TYPE_DEFAULT,
++                ..Default::default()
++            };
++            let mut float: Option<ID3D12Resource> = None;
++            device.CreateCommittedResource(
++                &heap,
++                D3D12_HEAP_FLAG_NONE,
++                &D3D12_RESOURCE_DESC {
++                    Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
++                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++                    ..desc
++                },
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                None,
++                &mut float,
++            )?;
++            let float = float.ok_or_else(Error::empty)?;
++            let mut packed: Option<ID3D12Resource> = None;
++            device.CreateCommittedResource(
++                &heap,
++                D3D12_HEAP_FLAG_NONE,
++                &D3D12_RESOURCE_DESC {
++                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++                    Width: size,
++                    Height: 1,
++                    DepthOrArraySize: 1,
++                    MipLevels: 1,
++                    SampleDesc: DXGI_SAMPLE_DESC {
++                        Count: 1,
++                        Quality: 0,
++                    },
++                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++                    ..Default::default()
++                },
++                D3D12_RESOURCE_STATE_COMMON,
++                None,
++                &mut packed,
++            )?;
++            let packed = packed.ok_or_else(Error::empty)?;
++            let srv: ID3D12DescriptorHeap =
++                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++                    NumDescriptors: 1,
++                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++                    ..Default::default()
++                })?;
++            device.CreateShaderResourceView(&float, None, srv.GetCPUDescriptorHandleForHeapStart());
++            Ok(Self {
++                float,
++                packed,
++                srv,
++                footprint,
++                packer,
++            })
++        }
++    }
++
++    pub(super) fn matches(&self, size: [u32; 2]) -> bool {
++        let footprint = &self.footprint.Footprint;
++        size == [footprint.Width, footprint.Height]
++    }
++
++    /// The FP16 texture the upscale writes (in unordered access), which
++    /// [`Output::copy_to`] packs.
++    pub(super) fn float(&self, list: &HostList) -> &ID3D12Resource {
++        list.keep(&self.float);
++        &self.float
++    }
++
++    pub(super) fn sdk_resource(&self, list: &HostList) -> Resource {
++        // The SDK can record references even if dispatch returns an error.
++        list.keep(&self.float);
++        // SAFETY: a live texture. The field order is ffxApiGetResourceDX12's.
++        let desc = unsafe { self.float.GetDesc() };
++        const FFX_TEXTURE_2D: u32 = 2;
++        const FFX_RGBA16_FLOAT: u32 = 4;
++        const FFX_USAGE_UAV: u32 = 1 << 1;
++        Resource {
++            resource: self.float.as_raw(),
++            description: [
++                FFX_TEXTURE_2D,
++                FFX_RGBA16_FLOAT,
++                desc.Width as u32,
++                desc.Height,
++                desc.DepthOrArraySize.into(),
++                desc.MipLevels.into(),
++                0,
++                FFX_USAGE_UAV,
++            ],
++            state: FFX_UNORDERED_ACCESS,
++        }
++    }
++
++    pub(super) fn copy_to(&self, list: &HostList, title: This, destination: &ID3D12Resource) {
++        crate::list::ensure_state(list, title, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
++        list.keep(&self.packed);
++        list.keep(&self.srv);
++        #[cfg(feature = "diagnostics")]
++        list.note_op(|| format!("pack FSR output into RGB9E5 title resource {title:?}"));
++        self.record_pack_and_copy(
++            &list.list,
++            destination,
++            &self.float,
++            &self.srv,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++        );
++    }
++
++    /// Destination is already in COPY_DEST. Restore the input and scratch
++    /// buffer states so the same resources can be recorded on other lists.
++    fn record_pack_and_copy(
++        &self,
++        list: &ID3D12GraphicsCommandList,
++        destination: &ID3D12Resource,
++        input: &ID3D12Resource,
++        srv: &ID3D12DescriptorHeap,
++        input_state: D3D12_RESOURCE_STATES,
++    ) {
++        let f = self.footprint.Footprint;
++        let constants = [f.Width, f.Height, f.RowPitch];
++        let source = D3D12_TEXTURE_COPY_LOCATION {
++            // SAFETY: the copy location borrows the live buffer without releasing it.
++            pResource: unsafe { std::mem::transmute_copy(&self.packed) },
++            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                PlacedFootprint: self.footprint,
++            },
++        };
++        let target = D3D12_TEXTURE_COPY_LOCATION {
++            // SAFETY: the copy location borrows the live texture without releasing it.
++            pResource: unsafe { std::mem::transmute_copy(destination) },
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                SubresourceIndex: 0,
++            },
++        };
++        // SAFETY: an open list; the caller retains the resources and heap.
++        unsafe {
++            // These locations borrow the COM references for the duration of the copy.
++            list.ResourceBarrier(&[
++                transition(
++                    input,
++                    input_state,
++                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                ),
++                transition(
++                    &self.packed,
++                    D3D12_RESOURCE_STATE_COMMON,
++                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                ),
++            ]);
++            list.SetDescriptorHeaps(&[Some(srv.clone())]);
++            list.SetComputeRootSignature(&self.packer.root);
++            list.SetPipelineState(&self.packer.pipeline);
++            list.SetComputeRootDescriptorTable(0, srv.GetGPUDescriptorHandleForHeapStart());
++            list.SetComputeRootUnorderedAccessView(1, self.packed.GetGPUVirtualAddress());
++            list.SetComputeRoot32BitConstants(2, 3, constants.as_ptr().cast(), 0);
++            list.Dispatch(f.Width.div_ceil(8), f.Height.div_ceil(8), 1);
++            list.ResourceBarrier(&[
++                transition(
++                    input,
++                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                    input_state,
++                ),
++                transition(
++                    &self.packed,
++                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                    D3D12_RESOURCE_STATE_COPY_SOURCE,
++                ),
++            ]);
++            list.CopyTextureRegion(&target, 0, 0, 0, &source, None);
++            list.ResourceBarrier(&[transition(
++                &self.packed,
++                D3D12_RESOURCE_STATE_COPY_SOURCE,
++                D3D12_RESOURCE_STATE_COMMON,
++            )]);
++        }
++    }
++}
++
++#[cfg(all(test, feature = "diagnostics"))]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn packs_hdr_pixels_into_a_sampleable_rgb9e5_texture() {
++        let Some(host) = host() else { eprintln!("no D3D12 device; skipping RGB9E5 GPU test"); return; };
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++            Width: 2,
++            Height: 2,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
++            SampleDesc: DXGI_SAMPLE_DESC {
++                Count: 1,
++                Quality: 0,
++            },
++            ..Default::default()
++        };
++        let make_destination = || {
++            let mut destination: Option<ID3D12Resource> = None;
++            // SAFETY: a single-sample test texture and our own output pointer.
++            unsafe {
++                host.device.CreateCommittedResource(
++                    &D3D12_HEAP_PROPERTIES {
++                        Type: D3D12_HEAP_TYPE_DEFAULT,
++                        ..Default::default()
++                    },
++                    D3D12_HEAP_FLAG_NONE,
++                    &desc,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    None,
++                    &mut destination,
++                )
++            }
++            .unwrap();
++            destination.unwrap()
++        };
++        let destination = make_destination();
++        let sampled = make_destination();
++        let output = Output::new(&destination).expect("RGB9E5 fallback resources and pipeline");
++        let list = host.new_list().unwrap();
++        let (upload, data) = host.upload_buffer(512).unwrap();
++        // FP16 pixels (1, .5, .25), (4, 2, -1), (0, 0, 0), and (32, 1, .125).
++        let pixels = [
++            [0x3c00u16, 0x3800, 0x3400, 0, 0x4400, 0x4000, 0xbc00, 0],
++            [0, 0, 0, 0, 0x5000, 0x3c00, 0x3000, 0],
++        ];
++        let from = D3D12_TEXTURE_COPY_LOCATION {
++            // SAFETY: upload stays live through execute.
++            pResource: unsafe { std::mem::transmute_copy(&upload) },
++            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                    Offset: 0,
++                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
++                        Width: 2,
++                        Height: 2,
++                        Depth: 1,
++                        RowPitch: 256,
++                    },
++                },
++            },
++        };
++        let to = D3D12_TEXTURE_COPY_LOCATION {
++            // SAFETY: output stays live through execute.
++            pResource: unsafe { std::mem::transmute_copy(&output.float) },
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                SubresourceIndex: 0,
++            },
++        };
++        // SAFETY: the mapped upload holds both padded rows; all resources
++        // live through submission and the transitions match their states.
++        let ((readback, footprint), _srv) = unsafe {
++            for (y, row) in pixels.iter().enumerate() {
++                data.add(y * 256).cast::<[u16; 8]>().write_unaligned(*row);
++            }
++            list.list.ResourceBarrier(&[transition(
++                &output.float,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++            )]);
++            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
++            list.list.ResourceBarrier(&[transition(
++                &output.float,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            )]);
++            output.record_pack_and_copy(
++                &list.list,
++                &destination,
++                &output.float,
++                &output.srv,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            );
++            // Sample the RGB9E5 output in a later compute pass and repack it
++            // into a second texture. Keep separate descriptors for both passes.
++            let srv: ID3D12DescriptorHeap = host
++                .device
++                .CreateDescriptorHeap(&output.srv.GetDesc())
++                .unwrap();
++            host.device.CreateShaderResourceView(
++                &destination,
++                None,
++                srv.GetCPUDescriptorHandleForHeapStart(),
++            );
++            output.record_pack_and_copy(
++                &list.list,
++                &sampled,
++                &destination,
++                &srv,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++            );
++            list.list.ResourceBarrier(&[transition(
++                &sampled,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++                D3D12_RESOURCE_STATE_COPY_SOURCE,
++            )]);
++            let readback = crate::capture::read_back(&host.device, &list.list, &sampled).unwrap();
++            (readback, srv)
++        };
++        list.close();
++        host.execute(&[&list]);
++        let mut data = std::ptr::null_mut();
++        let decode = |bits: u32| {
++            let scale = 2f32.powi((bits >> 27) as i32 - 24);
++            [0, 9, 18].map(|shift| ((bits >> shift) & 0x1ff) as f32 * scale)
++        };
++        // SAFETY: execute completed, and the footprint describes the mapped rows.
++        unsafe {
++            readback.Map(0, None, Some(&mut data)).unwrap();
++            let pixel = |x: usize, y: usize| {
++                let offset =
++                    footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize + x * 4;
++                decode(data.cast::<u8>().add(offset).cast::<u32>().read_unaligned())
++            };
++            assert_eq!(pixel(0, 0), [1.0, 0.5, 0.25]);
++            assert_eq!(pixel(1, 0), [4.0, 2.0, 0.0]);
++            assert_eq!(pixel(0, 1), [0.0; 3]);
++            assert_eq!(pixel(1, 1), [32.0, 1.0, 0.125]);
++            readback.Unmap(0, None);
++        }
++        assert_eq!(host.log_messages(), None);
++    }
++}
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -38,8 +38,10 @@
+ pub mod device;
+ #[cfg(windows)]
+ mod draw;
+-pub mod dxgi;
+-pub mod fence;
++pub mod dxgi;
++#[cfg(windows)]
++pub mod ffx;
++pub mod fence;
+ pub mod frame;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod book;
+diff --git a/crates/victory-hle/src/modules/mod.rs b/crates/victory-hle/src/modules/mod.rs
+--- a/crates/victory-hle/src/modules/mod.rs
++++ b/crates/victory-hle/src/modules/mod.rs
+@@ -13,9 +13,11 @@
+ pub mod audio;
+ pub mod d3d12x;
+ pub mod display;
+-pub mod dsp;
+-#[cfg(windows)]
+-pub mod dstorage;
++pub mod dsp;
++#[cfg(windows)]
++pub mod ffx;
++#[cfg(windows)]
++pub mod dstorage;
+ #[cfg(windows)]
+ pub mod files;
+ pub mod gameinput;
+@@ -71,7 +73,11 @@
+     #[cfg(windows)]
+     all.push(xmem::module());
+     #[cfg(windows)]
+-    all.push(xsystem::module());
+-    all
++    all.push(xsystem::module());
++    #[cfg(windows)]
++    if victory_gpu::ffx::enabled() {
++        all.push(ffx::module());
++    }
++    all
+ }
+ 
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -177,7 +177,12 @@
+     }
+ }
+ 
+-/// The host list behind a title list, if there is a host GPU.
++#[cfg(windows)]
++pub(crate) fn forget_host_bindings(this: This) {
++    with_state(this, |list, state| state.replay(list));
++}
++
++/// The host list behind a title list, if there is a host GPU.
+ #[cfg(windows)]
+ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+     if this.is_null() {
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -1161,8 +1161,9 @@
+ /// (console memory outlives the object; a host texture must outlive the
+ /// lists that name it).
+ #[cfg(windows)]
+-pub(crate) struct HostTexture {
+-    pub(crate) texture:
++pub(crate) struct HostTexture {
++    pub(crate) fsr_output: std::sync::OnceLock<Option<crate::ffx::rgb9e5::Output>>,
++    pub(crate) texture:
+     pub(crate) state: std::sync::atomic::AtomicU32,
+     /// The bytes the host gives it.
+     bytes: u64,
+@@ -2336,10 +2337,11 @@
+         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+         HOST_TEXTURES[0].fetch_add(1, Relaxed);
+         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+-        HostTexture {
+-            texture,
+-            state: std::sync::atomic::AtomicU32::new(state),
+-            bytes,
++        HostTexture {
++            fsr_output: Default::default(),
++            texture,
++            state: std::sync::atomic::AtomicU32::new(state),
++            bytes,
+             filled: false,
+             tiled: None,
+             base: 0,
+@@ -2363,10 +2365,11 @@
+         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         // SAFETY: a live texture.
+         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+-        HostTexture {
+-            texture,
+-            state: std::sync::atomic::AtomicU32::new(state),
+-            bytes: 0,
++        HostTexture {
++            fsr_output: Default::default(),
++            texture,
++            state: std::sync::atomic::AtomicU32::new(state),
++            bytes: 0,
+             filled: false,
+             tiled: Some(tiled),
+             base: 0,
+diff --git a/crates/victory-gpu/src/list/thin.rs b/crates/victory-gpu/src/list/thin.rs
+--- a/crates/victory-gpu/src/list/thin.rs
++++ b/crates/victory-gpu/src/list/thin.rs
+@@ -53,8 +53,10 @@
+ }
+ 
+ /// Whether it is asked for.
+-pub(crate) fn wanted() -> bool {
+-    static ON: OnceLock<bool>
++pub(crate) fn wanted() -> bool {
++    // The external FFX SDK records against a real list; no thin replay support yet.
++    if crate::ffx::enabled() { return false; }
++    static ON: OnceLock<bool>
+     *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+ }
+ 
+diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/queue/behind.rs
+--- a/crates/victory-gpu/src/queue/behind.rs
++++ b/crates/victory-gpu/src/queue/behind.rs
+@@ -643,8 +643,9 @@
+ /// Whether submissions are prepared by a thread of ours
+ /// (`VICTORY_ASYNC_SUBMIT=1`; needs flights with the present sent ahead, as
+ /// the relay has them, and lists cut at their waits).
+-pub(super) fn on() -> bool {
+-    // Diagnostics:
++pub(super) fn on() -> bool {
++    if crate::ffx::enabled() { return false; }
++    // Diagnostics:
+     #[cfg(feature = "diagnostics")]
+     if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
+         return on && started();
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2494,8 +2494,10 @@
+ }
+ 
+ /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+-fn late_stage() -> u8 {
+-    static STAGE: OnceLock<u8>
++fn late_stage() -> u8 {
++    // The SDK context and scratch lifetime must not outlive synchronous submissions.
++    if crate::ffx::enabled() { return 0; }
++    static STAGE: OnceLock<u8>
+     *STAGE.get_or_init(|| {
+         if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+             return 0;
